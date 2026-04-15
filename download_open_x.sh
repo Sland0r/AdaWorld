@@ -1,67 +1,19 @@
+#!/bin/bash
+
+#SBATCH --partition=staging
+#SBATCH --job-name=download_dataset
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --time=00:30:00
+#SBATCH --output=logs/download_dataset_%A.out
+
+module purge
+module load 2025
+module load Anaconda3/2025.06-1
+
 DOWNLOAD_DIR="rtx"
 DATASET_TRANSFORMS=(
-    "aloha_mobile"
-    "asu_table_top_converted_externally_to_rlds"
-    "austin_buds_dataset_converted_externally_to_rlds"
-    "austin_sailor_dataset_converted_externally_to_rlds"
-    "austin_sirius_dataset_converted_externally_to_rlds"
-    "bc_z"
-    "berkeley_autolab_ur5"
-    "berkeley_cable_routing"
-    "berkeley_fanuc_manipulation"
-    "berkeley_gnm_cory_hall"
-    "berkeley_gnm_recon"
-    "berkeley_gnm_sac_son"
-    "berkeley_mvp_converted_externally_to_rlds"
-    "berkeley_rpt_converted_externally_to_rlds"
-    "bridge"
-    "cmu_franka_exploration_dataset_converted_externally_to_rlds"
-    "cmu_play_fusion"
-    "cmu_playing_with_food"
-    "cmu_stretch"
-    "columbia_cairlab_pusht_real"
-    "conq_hose_manipulation"
-    "dlr_edan_shared_control_converted_externally_to_rlds"
-    "dlr_sara_grid_clamp_converted_externally_to_rlds"
-    "dlr_sara_pour_converted_externally_to_rlds"
-    "dobbe"
-    "droid"
-    "fmb"
-    "fractal20220817_data"
-    "furniture_bench_dataset_converted_externally_to_rlds"
-    "iamlab_cmu_pickup_insert_converted_externally_to_rlds"
-    "imperialcollege_sawyer_wrist_cam"
-    "io_ai_tech"
-    "jaco_play"
-    "kaist_nonprehensile_converted_externally_to_rlds"
-    "kuka"
-    "language_table"
-    "maniskill_dataset_converted_externally_to_rlds"
-    "mimic_play"
-    "nyu_door_opening_surprising_effectiveness"
-    "nyu_franka_play_dataset_converted_externally_to_rlds"
-    "nyu_rot_dataset_converted_externally_to_rlds"
-    "plex_robosuite"
-    "qut_dexterous_manpulation"
-    "robo_net"
-    "robo_set"
-    "robot_vqa"
-    "roboturk"
-    "stanford_hydra_dataset_converted_externally_to_rlds"
-    "stanford_kuka_multimodal_dataset_converted_externally_to_rlds"
-    "stanford_mask_vit_converted_externally_to_rlds"
-    "taco_play"
-    "tokyo_u_lsmo_converted_externally_to_rlds"
-    "toto"
-    "ucsd_kitchen_dataset_converted_externally_to_rlds"
-    "ucsd_pick_and_place_dataset_converted_externally_to_rlds"
-    "uiuc_d3field"
-    "utaustin_mutex"
-    "utokyo_pr2_opening_fridge_converted_externally_to_rlds"
-    "utokyo_pr2_tabletop_manipulation_converted_externally_to_rlds"
-    "utokyo_xarm_bimanual_converted_externally_to_rlds"
     "utokyo_xarm_pick_and_place_converted_externally_to_rlds"
-    "viola"
 )
 
 for tuple in "${DATASET_TRANSFORMS[@]}"; do
