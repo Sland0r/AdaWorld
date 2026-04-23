@@ -366,7 +366,7 @@ def parse_args() -> argparse.Namespace:
         help="Path to the first frame image (requires --frame2).",
     )
     group.add_argument(
-        "--video", type=str, help="Path to a video file."
+        "--video", type=str, help="Path to a video file, frame directory, game root directory, or dataset root directory."
     )
     group.add_argument(
         "--frame-dir", type=str, help="Directory of frame images (sorted alphabetically)."
@@ -386,6 +386,91 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _find_run_frame_dirs(root_dir: str) -> list[str]:
+    """Find run frame folders under a root using seed/episode/frames layout.
+
+    This supports either a single-game root or a dataset root containing many games.
+    """
+    pattern = os.path.join(root_dir, "**", "frames")
+    run_dirs = [p for p in glob.glob(pattern, recursive=True) if os.path.isdir(p)]
+    run_dirs = [p for p in run_dirs if len(Path(os.path.relpath(p, root_dir)).parts) >= 3]
+    run_dirs.sort()
+    return run_dirs
+
+
+def _extract_single_source(
+    model: LAM,
+    source_path: str,
+    args: argparse.Namespace,
+) -> tuple[list[torch.Tensor], list | None, list | None]:
+    """Load frames from one source and extract latent actions."""
+    actions, action_names = None, None
+    video_out = load_video_frames(
+        source_path,
+        resolution=args.resolution,
+        start_frame=args.start_frame,
+        max_frames=args.max_frames,
+        frame_skip=args.frame_skip,
+    )
+    if isinstance(video_out, tuple) and len(video_out) == 2:
+        frames, (actions, action_names) = video_out
+    else:
+        frames = video_out
+    results = extract_latent_actions_batch(model, frames, args.mu_only, device=args.device)
+    return results, actions, action_names
+
+
+def _run_batch_game_root(args: argparse.Namespace, model: LAM) -> list:
+    """Process all runs under a game root and save to mirrored output directories."""
+    root_dir = os.path.abspath(args.video)
+    run_frame_dirs = _find_run_frame_dirs(root_dir)
+
+    if not run_frame_dirs:
+        print(f"No run folders found under {root_dir} (expected seed/episode/frames).", file=sys.stderr)
+        sys.exit(1)
+
+    save_root = args.save_dir if args.save_dir else "./latent_actions_dump"
+    total = len(run_frame_dirs)
+    success = 0
+    failed = 0
+
+    print(f"Batch mode: found {total} run(s) under {root_dir}")
+    print(f"Saving outputs under: {save_root}/...")
+
+    for idx, run_frames in enumerate(run_frame_dirs, start=1):
+        rel = os.path.relpath(run_frames, root_dir)
+        rel_run = os.path.dirname(rel)
+        rel_parts = Path(rel).parts
+        if len(rel_parts) == 3:
+            run_id = f"{os.path.basename(os.path.normpath(root_dir))}/{rel_run}"
+            run_save_dir = os.path.join(save_root, os.path.basename(os.path.normpath(root_dir)), rel_run)
+        else:
+            run_id = rel_run
+            run_save_dir = os.path.join(save_root, rel_run)
+        out_pt = os.path.join(run_save_dir, "latent_actions.pt")
+
+        if os.path.exists(out_pt):
+            print(f"[{idx}/{total}] Skipping existing: {run_id}")
+            success += 1
+            continue
+
+        print(f"[{idx}/{total}] Processing: {run_id}")
+        try:
+            results, actions, action_names = _extract_single_source(model, run_frames, args)
+            save_results(results, run_save_dir, args.mu_only, actions=actions, action_names=action_names)
+            success += 1
+        except Exception as exc:
+            print(f"[{idx}/{total}] ERROR on {run_id}: {exc}", file=sys.stderr)
+            failed += 1
+
+    print(f"Batch complete. total={total} success={success} failed={failed}")
+    if failed > 0:
+        sys.exit(1)
+
+    # Returning empty list prevents downstream single-run assumptions.
+    return []
+
+
 def main() -> None:
     args = parse_args()
 
@@ -396,6 +481,12 @@ def main() -> None:
 
     # --- Load model ---
     model = load_lam(args.lam_ckpt, device=args.device)
+
+    # --- Batch mode for game root directories ---
+    if args.video and os.path.isdir(args.video):
+        run_frame_dirs = _find_run_frame_dirs(args.video)
+        if run_frame_dirs:
+            return _run_batch_game_root(args, model)
 
     # --- Load frames ---
     actions, action_names = None, None
@@ -436,9 +527,10 @@ def main() -> None:
 
     print(f"\n{'='*60}")
     print(f"  Summary: extracted {len(results)} latent action(s)")
-    print(f"  Latent dim: {results[0].shape[-1]}")
+    latent_dim = results[0].shape[-1] if args.mu_only else results[0]["z_mu"].shape[-1]
+    print(f"  Latent dim: {latent_dim}")
     if len(results) > 1:
-        all_mu = torch.stack([r for r in results])
+        all_mu = torch.stack([r for r in results]) if args.mu_only else torch.stack([r["z_mu"] for r in results])
         print(f"  Mean z_mu norm across pairs: {all_mu.norm(dim=-1).mean():.4f}")
         # Pairwise cosine similarity of consecutive actions
         cos_sims = F.cosine_similarity(all_mu[:-1], all_mu[1:], dim=-1)

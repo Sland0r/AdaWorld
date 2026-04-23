@@ -5,7 +5,7 @@
 #SBATCH --job-name=extract_latents
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --time=00:01:00
+#SBATCH --time=00:50:00
 #SBATCH --output=logs/extract_latents_%A.out
 
 module purge
@@ -15,8 +15,8 @@ source activate adaworld
 # needed for H100
 #pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118 --upgrade
 
-VIDEO_PATH=/home/scur0531/random_actions_data/dataset/retro_act_v0.0.0/retro_8eyes-nes_v0.0.0/000000/000001/frames
-python new_stuff/visualize.py --video $VIDEO_PATH \
+VIDEO_PATH=/home/scur0531/random_actions_data/dataset/retro_act_v0.0.0
+python new_stuff/extract_latent_actions.py --video $VIDEO_PATH \
 	--quiet \
 	--mu_only \
 	--save-dir ./latent_actions_dump
