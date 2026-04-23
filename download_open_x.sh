@@ -11,6 +11,8 @@ module purge
 module load 2025
 module load Anaconda3/2025.06-1
 
+source activate adaworld
+
 DOWNLOAD_DIR="rtx"
 DATASET_TRANSFORMS=(
     "utokyo_xarm_pick_and_place_converted_externally_to_rlds"
