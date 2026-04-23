@@ -1,3 +1,4 @@
+import argparse
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -7,8 +8,18 @@ import random
 from collections import defaultdict
 from pathlib import Path
 
+
+def build_mlp(in_dim, out_dim, n_hidden, hidden_dim=256):
+    if n_hidden == 0:
+        return nn.Linear(in_dim, out_dim)
+    layers = [nn.Linear(in_dim, hidden_dim), nn.ReLU()]
+    for _ in range(n_hidden - 1):
+        layers += [nn.Linear(hidden_dim, hidden_dim), nn.ReLU()]
+    layers.append(nn.Linear(hidden_dim, out_dim))
+    return nn.Sequential(*layers)
+
 def _get_game_name(path):
-    return Path(path).relative_to('latent_actions_dump').parts[0]
+    return Path(path).relative_to('latent_actions_dump').parts[1]
 
 
 def _format_actions(actions, num_samples, file_path):
@@ -30,7 +41,7 @@ def _build_dataset(samples):
 
 
 def load_data(test_ratio=0.2, seed=42):
-    files = sorted(glob.glob('latent_actions_dump/*/*/*/latent_actions.pt'))
+    files = sorted(glob.glob('latent_actions_dump/*/*/*/*/latent_actions.pt'))
     if not files:
         raise RuntimeError('No latent_actions.pt files found under latent_actions_dump/.')
 
@@ -98,10 +109,10 @@ def _accuracy_from_logits(logits, targets, action_mode):
         return (predictions == targets.long()).float()
 
     predictions = (torch.sigmoid(logits) >= 0.5).to(targets.dtype)
-    return (predictions == targets).view(targets.size(0), -1).all(dim=1).float()
+    return (predictions == targets).view(targets.size(0), -1).float().mean(dim=1)
 
 
-def evaluate(model, loader, action_mode, unique_games):
+def evaluate(model, loader, action_mode, unique_games, device):
     model.eval()
     total_correct = 0.0
     total_count = 0
@@ -110,8 +121,10 @@ def evaluate(model, loader, action_mode, unique_games):
 
     with torch.no_grad():
         for batch_z, batch_actions, batch_games in loader:
+            batch_z = batch_z.to(device)
+            batch_actions = batch_actions.to(device)
             logits = model(batch_z)
-            batch_correct = _accuracy_from_logits(logits, batch_actions, action_mode)
+            batch_correct = _accuracy_from_logits(logits, batch_actions, action_mode).cpu()
             total_correct += batch_correct.sum().item()
             total_count += batch_correct.numel()
 
@@ -129,16 +142,17 @@ def evaluate(model, loader, action_mode, unique_games):
     return total_accuracy, per_game_accuracy
 
 
-def train_multiclass_model(model, loader, criterion, optimizer, epochs, target_index=1):
+def train_multiclass_model(model, loader, criterion, optimizer, epochs, device, target_index=1):
     for epoch in range(epochs):
         model.train()
         total_loss = 0.0
 
         for batch_z, batch_targets, batch_games in loader:
+            batch_z = batch_z.to(device)
             if target_index == 1:
-                targets = batch_targets
+                targets = batch_targets.to(device)
             elif target_index == 2:
-                targets = batch_games
+                targets = batch_games.to(device)
             else:
                 raise ValueError(f"Unsupported target_index: {target_index}")
 
@@ -152,7 +166,7 @@ def train_multiclass_model(model, loader, criterion, optimizer, epochs, target_i
         print(f"Epoch {epoch + 1}/{epochs}, Loss: {total_loss / len(loader):.4f}")
 
 
-def evaluate_multiclass_model(model, loader, unique_games, target_index=1):
+def evaluate_multiclass_model(model, loader, unique_games, device, target_index=1):
     model.eval()
     total_correct = 0.0
     total_count = 0
@@ -161,16 +175,17 @@ def evaluate_multiclass_model(model, loader, unique_games, target_index=1):
 
     with torch.no_grad():
         for batch_z, batch_targets, batch_games in loader:
+            batch_z = batch_z.to(device)
             if target_index == 1:
-                targets = batch_targets
+                targets = batch_targets.to(device)
             elif target_index == 2:
-                targets = batch_games
+                targets = batch_games.to(device)
             else:
                 raise ValueError(f"Unsupported target_index: {target_index}")
 
             logits = model(batch_z)
             predictions = logits.argmax(dim=1)
-            batch_correct = (predictions == targets.long().view(-1)).float()
+            batch_correct = (predictions == targets.long().view(-1)).float().cpu()
             total_correct += batch_correct.sum().item()
             total_count += batch_correct.numel()
 
@@ -188,24 +203,38 @@ def evaluate_multiclass_model(model, loader, unique_games, target_index=1):
     return total_accuracy, per_game_accuracy
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--epochs', type=int, default=1)
+    parser.add_argument('--action_hidden_layers', type=int, default=1)
+    parser.add_argument('--game_hidden_layers', type=int, default=1)
+    parser.add_argument('--batch_size', type=int, default=256)
+    args = parser.parse_args()
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+
     print("Loading data...")
     train_dataset, test_dataset, num_actions, unique_games, action_mode = load_data()
     print(f"Train samples: {len(train_dataset)}, Test samples: {len(test_dataset)}")
     print(f"Games: {unique_games}")
-    
-    train_loader = DataLoader(train_dataset, batch_size=256, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=256, shuffle=False)
-    
-    # The linear model: predict action from latent encoding
-    model = nn.Linear(train_dataset.tensors[0].shape[1], num_actions)
+
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
+    print('Dataloader sizes:', len(train_loader), len(test_loader))
+
+    in_dim = train_dataset.tensors[0].shape[1]
+    epochs = args.epochs
+
+    model = build_mlp(in_dim, num_actions, args.action_hidden_layers).to(device)
     criterion = nn.CrossEntropyLoss() if action_mode == 'multiclass' else nn.BCEWithLogitsLoss()
     optimizer = optim.Adam(model.parameters(), lr=1e-3)
-    
-    epochs = 100
+
     print("Training started...")
     for epoch in range(epochs):
         total_loss = 0
         for batch_z, batch_actions, _ in train_loader:
+            batch_z = batch_z.to(device)
+            batch_actions = batch_actions.to(device)
             optimizer.zero_grad()
             pred = model(batch_z)
             if action_mode == 'multiclass':
@@ -215,26 +244,26 @@ def main():
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
-            
+
         print(f"Epoch {epoch+1}/{epochs}, Loss: {total_loss / len(train_loader):.4f}")
 
     print("Testing started...")
-    total_accuracy, per_game_accuracy = evaluate(model, test_loader, action_mode, unique_games)
+    total_accuracy, per_game_accuracy = evaluate(model, test_loader, action_mode, unique_games, device)
     print(f"Total accuracy: {total_accuracy:.4f}")
-    for game_name in unique_games:
-        print(f"{game_name}: {per_game_accuracy[game_name]:.4f}")
+    # for game_name in unique_games:
+    #     print(f"{game_name}: {per_game_accuracy[game_name]:.4f}")
 
     print("Training game predictor...")
-    game_model = nn.Linear(train_dataset.tensors[0].shape[1], len(unique_games))
+    game_model = build_mlp(in_dim, len(unique_games), args.game_hidden_layers).to(device)
     game_criterion = nn.CrossEntropyLoss()
     game_optimizer = optim.Adam(game_model.parameters(), lr=1e-3)
-    train_multiclass_model(game_model, train_loader, game_criterion, game_optimizer, epochs, target_index=2)
+    train_multiclass_model(game_model, train_loader, game_criterion, game_optimizer, epochs, device, target_index=2)
 
     print("Testing game predictor...")
-    game_accuracy, per_game_game_accuracy = evaluate_multiclass_model(game_model, test_loader, unique_games, target_index=2)
+    game_accuracy, per_game_game_accuracy = evaluate_multiclass_model(game_model, test_loader, unique_games, device, target_index=2)
     print(f"Game accuracy: {game_accuracy:.4f}")
-    for game_name in unique_games:
-        print(f"{game_name}: {per_game_game_accuracy[game_name]:.4f}")
+    # for game_name in unique_games:
+    #     print(f"{game_name}: {per_game_game_accuracy[game_name]:.4f}")
 
 if __name__ == '__main__':
     main()

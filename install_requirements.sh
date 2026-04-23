@@ -12,10 +12,13 @@ module load 2025
 module load Anaconda3/2025.06-1
 
 # create env
-# conda create -n adaworld python=3.10 -y
+conda create -n adaworld python=3.10 -y
 
 # activate env
 source activate adaworld
 
 # install requirements
 pip install -r requirements.txt
+
+# needed for H100
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118 --upgrade

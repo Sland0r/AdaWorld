@@ -12,8 +12,6 @@ module purge
 module load 2025
 module load Anaconda3/2025.06-1
 source activate adaworld
-# needed for H100
-#pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118 --upgrade
 
 VIDEO_PATH=/home/scur0531/random_actions_data/dataset/retro_act_v0.0.0
 python new_stuff/extract_latent_actions.py --video $VIDEO_PATH \

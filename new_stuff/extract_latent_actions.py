@@ -43,6 +43,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 WORLDMODEL_DIR = SCRIPT_DIR.parent / "worldmodel"
 if str(WORLDMODEL_DIR) not in sys.path:
     sys.path.insert(0, str(WORLDMODEL_DIR))
+OLAFWORLD_DIR = SCRIPT_DIR.parent / "olafworld"
 
 from external.lam.model import LAM
 
@@ -52,6 +53,10 @@ from external.lam.model import LAM
 DEFAULT_LAM_CKPT = str(WORLDMODEL_DIR / "checkpoints" / "lam.ckpt")
 HF_LAM_URL = "https://huggingface.co/Little-Podi/AdaWorld/resolve/main/lam.ckpt"
 RESOLUTION = 256
+
+DEFAULT_OLAF_CKPT_ALIGN = str(OLAFWORLD_DIR / "checkpoints" / "lam" / "lam_vjepa_align.ckpt")
+DEFAULT_OLAF_CKPT_VAE = str(OLAFWORLD_DIR / "checkpoints" / "lam" / "lam.ckpt")
+HF_OLAF_REPO = "YuxinJ/Olaf-World"
 
 # LAM architecture hyper-parameters (must match the pretrained checkpoint)
 LAM_CONFIG = dict(
@@ -105,6 +110,52 @@ def load_lam(ckpt_path: str | None = None, device: str = "cuda") -> LAM:
     model = model.to(device).eval()
     print(f"LAM loaded from {ckpt_path}  (device={device})")
     return model
+
+
+def load_olaf_encoder(ckpt_path: str | None = None, variant: str = "align", device: str = "cuda"):
+    """Load the OlafWorld FrozenLAMEncoder.
+
+    Requires the OlafWorld repo cloned at ``<project_root>/olafworld/``.
+    Checkpoint is downloaded from HuggingFace if not present locally.
+    """
+    if str(OLAFWORLD_DIR) not in sys.path:
+        sys.path.insert(0, str(OLAFWORLD_DIR))
+
+    try:
+        from lam.inference import FrozenLAMEncoder
+    except ImportError as e:
+        print(
+            f"ERROR: Could not import OlafWorld. Make sure the repo is cloned at {OLAFWORLD_DIR}\n"
+            f"  git clone https://github.com/showlab/Olaf-World {OLAFWORLD_DIR}\n"
+            f"  Original error: {e}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if ckpt_path is None:
+        ckpt_path = DEFAULT_OLAF_CKPT_ALIGN if variant == "align" else DEFAULT_OLAF_CKPT_VAE
+
+    if not os.path.exists(ckpt_path):
+        hf_filename = "lam/lam_vjepa_align.ckpt" if variant == "align" else "lam/lam.ckpt"
+        print(f"Downloading OlafWorld checkpoint ({variant}) from HuggingFace ...")
+        try:
+            from huggingface_hub import hf_hub_download
+            ckpt_path = hf_hub_download(
+                repo_id=HF_OLAF_REPO,
+                filename=hf_filename,
+                local_dir=str(OLAFWORLD_DIR / "checkpoints"),
+            )
+        except Exception as e:
+            print(
+                f"ERROR: Could not download OlafWorld checkpoint: {e}\n"
+                f"  Manually download from https://huggingface.co/{HF_OLAF_REPO}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    encoder = FrozenLAMEncoder(ckpt_path=ckpt_path, variant=variant, device=device)
+    print(f"OlafWorld encoder loaded from {ckpt_path}  (variant={variant}, device={device})")
+    return encoder
 
 
 # ========================== Image I/O ======================================
@@ -256,39 +307,54 @@ def extract_latent_action(
 
 @torch.no_grad()
 def extract_latent_actions_batch(
-    model: LAM,
+    model,
     frames: list[torch.Tensor],
     mu_only: bool,
     device: str = "cuda",
-) -> list[dict[str, torch.Tensor]]:
+    model_type: str = "adaworld",
+) -> list:
     """Extract latent actions for all consecutive pairs in *frames*.
 
     Returns a list of dicts (one per consecutive pair), each containing
     ``z_mu``, ``z_var``, ``z_rep`` of shape ``(latent_dim,)``.
+    For OlafWorld, ``z_var`` is zeros (the encoder is deterministic).
     """
-    results: list[dict[str, torch.Tensor]] = []
+    results = []
     batch_size = 128
-    
-    # Pre-construct pairs (2, H, W, C)
+
     pairs = [torch.stack([frames[i], frames[i+1]], dim=0) for i in range(len(frames) - 1)]
-    
+
     for i in range(0, len(pairs), batch_size):
         batch = pairs[i:i + batch_size]
         video_batch = torch.stack(batch, dim=0).to(device)  # (B, 2, H, W, C)
-        
-        outputs = model.lam.encode(video_batch)
-        if mu_only:
-            for j in range(video_batch.size(0)):
-                results.append(outputs['z_mu'][j].cpu())
-        
+
+        if model_type == "olafworld":
+            z = model(video_batch)          # (B, 1, D) or (B, D)
+            if z.dim() == 3:
+                z = z.squeeze(1)            # (B, D)
+            for j in range(z.size(0)):
+                z_j = z[j].cpu()
+                if mu_only:
+                    results.append(z_j)
+                else:
+                    results.append({
+                        "z_mu": z_j,
+                        "z_var": torch.zeros_like(z_j),
+                        "z_rep": z_j,
+                    })
         else:
-            for j in range(video_batch.size(0)):
-                results.append({
-                    "z_mu": outputs["z_mu"][j].cpu(),
-                    "z_var": outputs["z_var"][j].cpu(),
-                    "z_rep": outputs["z_rep"][j].cpu(),
-                })
-            
+            outputs = model.lam.encode(video_batch)
+            if mu_only:
+                for j in range(video_batch.size(0)):
+                    results.append(outputs['z_mu'][j].cpu())
+            else:
+                for j in range(video_batch.size(0)):
+                    results.append({
+                        "z_mu": outputs["z_mu"][j].cpu(),
+                        "z_var": outputs["z_var"][j].cpu(),
+                        "z_rep": outputs["z_rep"][j].cpu(),
+                    })
+
     return results
 
 
@@ -373,7 +439,22 @@ def parse_args() -> argparse.Namespace:
     )
 
     p.add_argument("--frame2", type=str, help="Path to the second frame image.")
-    p.add_argument("--lam-ckpt", type=str, default=None, help="Path to LAM checkpoint (.ckpt).")
+    p.add_argument(
+        "--model",
+        type=str,
+        default="adaworld",
+        choices=["adaworld", "olafworld"],
+        help="Action encoder model to use (default: adaworld).",
+    )
+    p.add_argument("--lam-ckpt", type=str, default=None, help="Path to AdaWorld LAM checkpoint (.ckpt).")
+    p.add_argument("--olaf-ckpt", type=str, default=None, help="Path to OlafWorld LAM checkpoint (.ckpt).")
+    p.add_argument(
+        "--olaf-variant",
+        type=str,
+        default="align",
+        choices=["vae", "align"],
+        help="OlafWorld checkpoint variant: 'align' (τ-aligned, recommended) or 'vae' (baseline).",
+    )
     p.add_argument("--resolution", type=int, default=RESOLUTION, help="Input resolution (default: 256).")
     p.add_argument("--start-frame", type=int, default=0, help="Start frame index for video input.")
     p.add_argument("--max-frames", type=int, default=None, help="Max frames to read from video.")
@@ -399,9 +480,10 @@ def _find_run_frame_dirs(root_dir: str) -> list[str]:
 
 
 def _extract_single_source(
-    model: LAM,
+    model,
     source_path: str,
     args: argparse.Namespace,
+    model_type: str = "adaworld",
 ) -> tuple[list[torch.Tensor], list | None, list | None]:
     """Load frames from one source and extract latent actions."""
     actions, action_names = None, None
@@ -416,11 +498,11 @@ def _extract_single_source(
         frames, (actions, action_names) = video_out
     else:
         frames = video_out
-    results = extract_latent_actions_batch(model, frames, args.mu_only, device=args.device)
+    results = extract_latent_actions_batch(model, frames, args.mu_only, device=args.device, model_type=model_type)
     return results, actions, action_names
 
 
-def _run_batch_game_root(args: argparse.Namespace, model: LAM) -> list:
+def _run_batch_game_root(args: argparse.Namespace, model, model_type: str = "adaworld") -> list:
     """Process all runs under a game root and save to mirrored output directories."""
     root_dir = os.path.abspath(args.video)
     run_frame_dirs = _find_run_frame_dirs(root_dir)
@@ -443,10 +525,10 @@ def _run_batch_game_root(args: argparse.Namespace, model: LAM) -> list:
         rel_parts = Path(rel).parts
         if len(rel_parts) == 3:
             run_id = f"{os.path.basename(os.path.normpath(root_dir))}/{rel_run}"
-            run_save_dir = os.path.join(save_root, os.path.basename(os.path.normpath(root_dir)), rel_run)
+            run_save_dir = os.path.join(save_root, model_type, os.path.basename(os.path.normpath(root_dir)), rel_run)
         else:
             run_id = rel_run
-            run_save_dir = os.path.join(save_root, rel_run)
+            run_save_dir = os.path.join(save_root, model_type, rel_run)
         out_pt = os.path.join(run_save_dir, "latent_actions.pt")
 
         if os.path.exists(out_pt):
@@ -456,7 +538,7 @@ def _run_batch_game_root(args: argparse.Namespace, model: LAM) -> list:
 
         print(f"[{idx}/{total}] Processing: {run_id}")
         try:
-            results, actions, action_names = _extract_single_source(model, run_frames, args)
+            results, actions, action_names = _extract_single_source(model, run_frames, args, model_type=model_type)
             save_results(results, run_save_dir, args.mu_only, actions=actions, action_names=action_names)
             success += 1
         except Exception as exc:
@@ -480,13 +562,17 @@ def main() -> None:
         sys.exit(1)
 
     # --- Load model ---
-    model = load_lam(args.lam_ckpt, device=args.device)
+    model_type = args.model
+    if model_type == "olafworld":
+        model = load_olaf_encoder(args.olaf_ckpt, args.olaf_variant, device=args.device)
+    else:
+        model = load_lam(args.lam_ckpt, device=args.device)
 
     # --- Batch mode for game root directories ---
     if args.video and os.path.isdir(args.video):
         run_frame_dirs = _find_run_frame_dirs(args.video)
         if run_frame_dirs:
-            return _run_batch_game_root(args, model)
+            return _run_batch_game_root(args, model, model_type=model_type)
 
     # --- Load frames ---
     actions, action_names = None, None
@@ -523,7 +609,7 @@ def main() -> None:
         sys.exit(1)
 
     # --- Extract ---
-    results = extract_latent_actions_batch(model, frames, args.mu_only, device=args.device)
+    results = extract_latent_actions_batch(model, frames, args.mu_only, device=args.device, model_type=model_type)
 
     print(f"\n{'='*60}")
     print(f"  Summary: extracted {len(results)} latent action(s)")
