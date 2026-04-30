@@ -147,6 +147,7 @@ def evaluate(model, loader, action_mode, unique_games, device):
             batch_actions = batch_actions.to(device)
             logits = model(batch_z)
             batch_correct = _accuracy_from_logits(logits, batch_actions, action_mode).cpu()
+            batch_actions = batch_actions.cpu()
             total_correct += batch_correct.sum().item()
             total_count += batch_correct.numel()
 
