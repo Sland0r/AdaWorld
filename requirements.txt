@@ -1,9 +1,9 @@
-procgen>=0.10.7
+# procgen>=0.10.7
 tqdm==4.66.5
-pytorch-lightning==2.0.1
+# pytorch-lightning==2.0.1
 opencv-python==4.10.0.84
 transformers==4.19.1
-triton==2.0.0
+# triton==2.0.0
 einops==0.8.0
 piq==0.8.0
 xformers>=0.0.20

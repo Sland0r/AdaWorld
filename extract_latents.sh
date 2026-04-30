@@ -11,13 +11,16 @@
 module purge
 module load 2025
 module load Anaconda3/2025.06-1
-source activate adaworld
+PYTHON=~/.conda/envs/adaworld/bin/python
+export PYTHONNOUSERSITE=1
+export PYTHONPATH=""
 
-VIDEO_PATH=/home/scur0531/random_actions_data/dataset/retro_act_v0.0.0
-python new_stuff/extract_latent_actions.py --video $VIDEO_PATH \
+VIDEO_PATH=/home/scur0531/random_actions_data/dataset/retro_act_v0.0.0_random
+$PYTHON new_stuff/extract_latent_actions.py --video $VIDEO_PATH \
 	--quiet \
 	--mu_only \
-	--save-dir ./latent_actions_dump
+	--save-dir ./latent_actions_dump \
+	--model adaworld \
 
 
 # PATH CAN BE EITHER MP4 OR FOLDER OF FRAMES

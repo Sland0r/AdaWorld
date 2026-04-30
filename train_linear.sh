@@ -18,4 +18,7 @@ python new_stuff/train_linear.py \
     --epochs 100 \
     --batch_size 256 \
     --action_hidden_layers 0 \
-    --game_hidden_layers 0
+    --game_hidden_layers 0 \
+    --dataset olafworld \
+    #--mask 7 11 15 17
+    #--dataset adaworld

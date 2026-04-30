@@ -32,7 +32,6 @@ import os
 import sys
 from pathlib import Path
 
-import cv2 as cv
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -53,6 +52,7 @@ from external.lam.model import LAM
 DEFAULT_LAM_CKPT = str(WORLDMODEL_DIR / "checkpoints" / "lam.ckpt")
 HF_LAM_URL = "https://huggingface.co/Little-Podi/AdaWorld/resolve/main/lam.ckpt"
 RESOLUTION = 256
+OLAFWORLD_RESOLUTION = (272, 480)  # (H, W) from olafworld/configs/lam/*.yaml
 
 DEFAULT_OLAF_CKPT_ALIGN = str(OLAFWORLD_DIR / "checkpoints" / "lam" / "lam_vjepa_align.ckpt")
 DEFAULT_OLAF_CKPT_VAE = str(OLAFWORLD_DIR / "checkpoints" / "lam" / "lam.ckpt")
@@ -161,16 +161,20 @@ def load_olaf_encoder(ckpt_path: str | None = None, variant: str = "align", devi
 # ========================== Image I/O ======================================
 
 
-def load_image(path: str, resolution: int = RESOLUTION) -> torch.Tensor:
+def load_image(path: str, resolution: int | tuple[int, int] = RESOLUTION) -> torch.Tensor:
     """Load a single image and return a tensor of shape (H, W, C) in [0, 1]."""
     img = Image.open(path).convert("RGB")
-    img = img.resize((resolution, resolution), Image.BICUBIC)
+    if isinstance(resolution, tuple):
+        h, w = resolution
+        img = img.resize((w, h), Image.BICUBIC)
+    else:
+        img = img.resize((resolution, resolution), Image.BICUBIC)
     return torch.from_numpy(np.array(img)).float() / 255.0
 
 
 def load_video_frames(
     path: str,
-    resolution: int = RESOLUTION,
+    resolution: int | tuple[int, int] = RESOLUTION,
     start_frame: int = 0,
     max_frames: int | None = None,
     frame_skip: int = 1,
@@ -182,8 +186,8 @@ def load_video_frames(
     path : str
         Either the path to a video file (e.g. ``.mp4``) or a directory
         containing ordered frame images (``.png``, ``.jpg``, …).
-    resolution : int
-        Spatial size to resize every frame to ``(resolution, resolution)``.
+    resolution : int or (H, W) tuple
+        Spatial size to resize every frame to. Int → square; tuple → (H, W).
     start_frame : int
         Index of the first frame to include.
     max_frames : int | None
@@ -246,6 +250,8 @@ def load_video_frames(
 
         frames = [load_image(p, resolution) for p in paths]
         return frames, (actions_list, action_names)
+    else:
+        raise FileNotFoundError(f"The path '{path}' does not exist or is not a directory. Video file parsing was removed or unsupported.")
 
 
 def load_frame_directory(
@@ -565,6 +571,8 @@ def main() -> None:
     model_type = args.model
     if model_type == "olafworld":
         model = load_olaf_encoder(args.olaf_ckpt, args.olaf_variant, device=args.device)
+        if args.resolution == RESOLUTION:
+            args.resolution = OLAFWORLD_RESOLUTION
     else:
         model = load_lam(args.lam_ckpt, device=args.device)
 
