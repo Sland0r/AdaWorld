@@ -5,7 +5,7 @@
 #SBATCH --job-name=analysis
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --time=00:50:00
+#SBATCH --time=00:10:00
 #SBATCH --output=logs/analysis_%A.out
 
 module purge
@@ -16,5 +16,5 @@ export PYTHONNOUSERSITE=1
 export PYTHONPATH=""
 
 $PYTHON new_stuff/analysis.py \
-    --dataset adaworld \
+    --dataset olafworld \
     --dump-dir 2 \

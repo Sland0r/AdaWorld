@@ -5,7 +5,6 @@
 #SBATCH --job-name=extract_p2p
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=128G
 #SBATCH --time=05:00:00
 #SBATCH --output=logs/extract_p2p_%A.out
 

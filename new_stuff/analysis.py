@@ -319,51 +319,119 @@ def main():
         vec = vec / np.linalg.norm(vec)
         print(f"  LD{i+1}: {np.array2string(vec, precision=4, suppress_small=True, separator=', ', max_line_width=120)}")
 
-    # ---- build probe dataset (may differ for dump_dir=2) ----
+    # ---- build probe dataset (multi-label: top 10 individual keys) ----
+    # Extract all individual keys from original action tuples and find top 10
     if args.dump_dir == 2 and original_action_z_mu:
-        probe_action_list = sorted(original_action_z_mu.keys(), key=lambda a: len(original_action_z_mu[a]), reverse=True)
-        X_probe = np.concatenate([torch.cat(original_action_z_mu[act], dim=0).numpy() for act in probe_action_list], axis=0)
-        y_probe = np.concatenate([
-            np.full(len(original_action_z_mu[act]), i, dtype=np.int32)
-            for i, act in enumerate(probe_action_list)
-        ])
-        action_label_probe = {act: f"P{i}" for i, act in enumerate(probe_action_list)}
+        all_keys = {}
+        action_to_zmu = {}  # Map action tuple to list of (z_mu, action_tuple)
+        
+        for act, z_mus in original_action_z_mu.items():
+            action_to_zmu[act] = z_mus
+            for key in act:
+                all_keys[key] = all_keys.get(key, 0) + len(z_mus)
+        
+        # Get top 10 keys by frequency
+        top_keys = sorted(all_keys.keys(), key=lambda k: all_keys[k], reverse=True)[:10]
+        key_to_idx = {key: i for i, key in enumerate(top_keys)}
+        
+        print(f"  Using multi-label classification with top 10 individual keys:")
+        print(f"  {top_keys}")
+        
+        # Collect all samples and create multi-hot labels
+        X_probe_list = []
+        y_probe_list = []
+        
+        for act, z_mus in action_to_zmu.items():
+            # Create multi-hot label for this action
+            label = np.zeros(10, dtype=np.int32)
+            for key in act:
+                if key in key_to_idx:
+                    label[key_to_idx[key]] = 1
+            
+            # Add all z_mu samples with this label
+            z_mu_cat = torch.cat(z_mus, dim=0).numpy()
+            X_probe_list.append(z_mu_cat)
+            y_probe_list.append(np.tile(label, (z_mu_cat.shape[0], 1)))
+        
+        X_probe = np.concatenate(X_probe_list, axis=0)
+        y_probe = np.concatenate(y_probe_list, axis=0)
+        
     else:
-        probe_action_list = action_list
-        X_probe = X_labeled
-        y_probe = y_labeled
-        action_label_probe = action_label
+        print("  ERROR: Multi-label probe requires dump_dir=2 with original_action_z_mu")
+        top_keys = []
+        key_to_idx = {}
+        X_probe = None
+        y_probe = None
 
     print("\n" + "="*80)
     # -------------------------------------------------------- 4. LINEAR PROBE --
     print("\n" + "="*80)
-    print("  4. LINEAR PROBE (logistic regression  z_mu → action)")
+    print("  4. LINEAR PROBE (Multi-label: predict any combination of 10 keys)")
     print("="*80)
 
-    if args.dump_dir == 2 and original_action_z_mu:
-        print("  Using original action tuples for probe (no expansion).")
-        print("  Probe action legend:")
-        for act in probe_action_list:
-            print(f"    {action_label_probe[act]}: {act}  (n={len(original_action_z_mu[act])})")
+    if X_probe is not None and y_probe is not None:
+        from sklearn.multioutput import MultiOutputClassifier
+        
+        # Split preserving multi-label structure
+        X_tr, X_te, y_tr, y_te = train_test_split(
+            X_probe, y_probe, test_size=0.2, random_state=42
+        )
+        
+        # Train a binary classifier for each key (multi-label)
+        probe = MultiOutputClassifier(
+            LogisticRegression(max_iter=1000, C=1.0, solver='lbfgs')
+        )
+        probe.fit(X_tr, y_tr)
+        
+        # Evaluate
+        y_pred = probe.predict(X_te)
+        
+        # Hamming loss (fraction of incorrect labels)
+        from sklearn.metrics import hamming_loss, accuracy_score, precision_recall_fscore_support
+        hamming = hamming_loss(y_te, y_pred)
+        
+        # Exact match accuracy (all 10 labels correct)
+        exact_match = accuracy_score(y_te, y_pred)
+        
+        # Overall multi-label precision/recall/F1
+        p_micro, r_micro, f1_micro, _ = precision_recall_fscore_support(
+            y_te, y_pred, average='micro', zero_division=0
+        )
+        p_macro, r_macro, f1_macro, _ = precision_recall_fscore_support(
+            y_te, y_pred, average='macro', zero_division=0
+        )
 
-    X_tr, X_te, y_tr, y_te = train_test_split(
-        X_probe, y_probe, test_size=0.2, random_state=42, stratify=y_probe
-    )
-    probe = LogisticRegression(max_iter=1000, C=1.0, solver='lbfgs', multi_class='multinomial')
-    probe.fit(X_tr, y_tr)
-
-    acc    = probe.score(X_te, y_te)
-    chance = np.bincount(y_probe).max() / len(y_probe)
-    y_pred = probe.predict(X_te)
-
-    print(f"\n  Test accuracy : {acc:.4f}  ({acc*100:.1f}%)")
-    print(f"  Chance level  : {chance:.4f}  ({chance*100:.1f}%)")
-    print(f"  Lift          : {acc/chance:.2f}x")
-    print("\n  Per-action accuracy:")
-    for i, act in enumerate(probe_action_list):
-        mask    = y_te == i
-        cls_acc = (y_pred[mask] == i).mean() if mask.sum() > 0 else float('nan')
-        print(f"    {action_label_probe[act]} {act}: {cls_acc:.4f}  (n={mask.sum()})")
+        # Per-key metrics
+        per_key_acc = []
+        per_key_precision = []
+        per_key_recall = []
+        per_key_f1 = []
+        for i, key in enumerate(top_keys):
+            key_pred = y_pred[:, i]
+            key_true = y_te[:, i]
+            key_acc = accuracy_score(key_true, key_pred)
+            key_p, key_r, key_f1, _ = precision_recall_fscore_support(
+                key_true, key_pred, average='binary', zero_division=0
+            )
+            per_key_acc.append(key_acc)
+            per_key_precision.append(key_p)
+            per_key_recall.append(key_r)
+            per_key_f1.append(key_f1)
+        
+        print(f"\n  Exact match accuracy (all 10 correct): {exact_match:.4f}  ({exact_match*100:.1f}%)")
+        print(f"  Hamming loss (label error rate):      {hamming:.4f}  ({hamming*100:.1f}%)")
+        print(f"  Micro P/R/F1:                         {p_micro:.4f} / {r_micro:.4f} / {f1_micro:.4f}")
+        print(f"  Macro P/R/F1:                         {p_macro:.4f} / {r_macro:.4f} / {f1_macro:.4f}")
+        print(f"\n  Per-key metrics:")
+        for i, key in enumerate(top_keys):
+            pos_count = (y_te[:, i] == 1).sum()
+            neg_count = (y_te[:, i] == 0).sum()
+            print(
+                f"    Key {i}: {key:15s} — "
+                f"Acc: {per_key_acc[i]:.4f}, "
+                f"P/R/F1: {per_key_precision[i]:.4f}/{per_key_recall[i]:.4f}/{per_key_f1[i]:.4f}  "
+                f"(pos={pos_count}, neg={neg_count})"
+            )
 
     # --------------------------------------------------- 5. ENTANGLEMENT TEST --
     print("\n" + "="*80)

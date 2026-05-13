@@ -15,9 +15,9 @@ source activate adaworld
 
 
 python new_stuff/train_linear.py \
-    --epochs 1000 \
+    --epochs 100 \
     --batch_size 256 \
-    --action_hidden_layers 3 \
+    --action_hidden_layers 1 \
     --game_hidden_layers 0 \
     --dataset olafworld \
-    --dump-dir 1 \
+    --dump-dir 2 \
