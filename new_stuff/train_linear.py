@@ -7,6 +7,7 @@ import glob
 import random
 from collections import defaultdict
 from pathlib import Path
+import os
 
 
 def build_mlp(in_dim, out_dim, n_hidden, hidden_dim=256):
@@ -18,8 +19,18 @@ def build_mlp(in_dim, out_dim, n_hidden, hidden_dim=256):
     layers.append(nn.Linear(hidden_dim, out_dim))
     return nn.Sequential(*layers)
 
-def _get_game_name(path):
-    return Path(path).relative_to('latent_actions_dump').parts[1]
+def _get_game_name(data, path):
+    if data.get('game_name'):
+        return data['game_name']
+    parts = Path(path).parts
+    # Fallback to path heuristics
+    path_str = str(path)
+    if 'latent_actions_dump_2' in path_str:
+        return parts[-3] if len(parts) >= 3 else 'unknown'
+    if 'latent_actions_dump' in path_str:
+        return parts[-4] if len(parts) >= 4 else 'unknown'
+    return parts[-2] if len(parts) >= 2 else 'unknown'
+    
 
 
 def _format_actions(actions, num_samples, file_path):
@@ -33,6 +44,58 @@ def _format_actions(actions, num_samples, file_path):
     return actions
 
 
+def _resolve_dump_base_dir(dump_dir_idx):
+    base_name = 'latent_actions_dump' if dump_dir_idx == 1 else 'latent_actions_dump_2'
+    repo_root = Path(__file__).resolve().parents[1]
+    return base_name, str(repo_root / base_name)
+
+
+def _extract_actions(data, num_samples, file_path):
+    actions_raw = data.get('actions')
+    has_dense_actions = False
+    if actions_raw is not None:
+        try:
+            has_dense_actions = len(actions_raw) > 0
+        except TypeError:
+            has_dense_actions = True
+
+    if has_dense_actions:
+        actions = _format_actions(actions_raw, num_samples, file_path)
+        if actions.ndim == 2 and actions.shape[1] == 1 and torch.all(actions == actions.long().to(actions.dtype)):
+            actions = actions.squeeze(1)
+        return actions
+
+    keyboard_labels = data.get('keyboard_labels')
+    if keyboard_labels is None:
+        return None
+
+    keyboard_labels = torch.as_tensor(keyboard_labels)
+    if keyboard_labels.ndim == 1:
+        keyboard_labels = keyboard_labels.unsqueeze(0)
+    if keyboard_labels.shape[0] != num_samples:
+        raise ValueError(
+            f"Action count mismatch in {file_path}: z_mu has {num_samples} samples "
+            f"but keyboard_labels has shape {tuple(keyboard_labels.shape)}"
+        )
+    keyboard_labels = (keyboard_labels > 0).to(torch.float32)
+
+    mouse_left_right = torch.zeros((num_samples, 2), dtype=torch.float32)
+    mouse_buttons = data.get('mouse_buttons')
+    if mouse_buttons is not None:
+        mouse_buttons = torch.as_tensor(mouse_buttons)
+        if mouse_buttons.ndim == 0:
+            mouse_buttons = mouse_buttons.unsqueeze(0)
+        if mouse_buttons.shape[0] != num_samples:
+            raise ValueError(
+                f"Action count mismatch in {file_path}: z_mu has {num_samples} samples "
+                f"but mouse_buttons has shape {tuple(mouse_buttons.shape)}"
+            )
+        mouse_left_right[:, 0] = (mouse_buttons == 0).to(torch.float32)
+        mouse_left_right[:, 1] = (mouse_buttons == 1).to(torch.float32)
+
+    return torch.cat([keyboard_labels, mouse_left_right], dim=1)
+
+
 def _build_dataset(samples):
     z = torch.stack([sample[0] for sample in samples], dim=0)
     actions = torch.stack([sample[1] for sample in samples], dim=0)
@@ -40,28 +103,24 @@ def _build_dataset(samples):
     return z, actions, games
 
 
-def load_data(test_ratio=0.2, seed=42, dataset='both'):
+def load_data(test_ratio=0.2, seed=42, dataset='both', dump_dir_idx=1):
+    base_name, base_dir = _resolve_dump_base_dir(dump_dir_idx)
     if dataset == 'both':
-        files = sorted(glob.glob('latent_actions_dump/*/*/*/*/latent_actions.pt'))
+        files = glob.glob(os.path.join(base_dir, "**", "latent_actions.pt"), recursive=True)
     else:
-        files = sorted(glob.glob(f'latent_actions_dump/{dataset}/*/*/*/latent_actions.pt'))
+        files = glob.glob(os.path.join(base_dir, dataset, "**", "latent_actions.pt"), recursive=True)
+    files = sorted(files)
     if not files:
-        raise RuntimeError('No latent_actions.pt files found under latent_actions_dump/.')
+        raise RuntimeError(f'No latent_actions.pt files found under {base_name}/ ({base_dir}).')
 
     samples_by_game = defaultdict(list)
     unique_games = []
 
     for f in files:
-        game_name = _get_game_name(f)
-        if game_name not in samples_by_game:
-            unique_games.append(game_name)
-
-        data = torch.load(f, map_location='cpu')
-        
-        # Skip files that don't have actions (e.g. actions.json was missing)
-        actions_raw = data.get('actions')
-        if actions_raw is None or len(actions_raw) == 0:
-            print(f"Skipping {f} because no actions were found.")
+        try:
+            data = torch.load(f, map_location='cpu')
+        except Exception as e:
+            print(f"Skipping {f}: failed to load ({e})")
             continue
 
         z = torch.as_tensor(data['z_mu'], dtype=torch.float32)
@@ -69,15 +128,26 @@ def load_data(test_ratio=0.2, seed=42, dataset='both'):
             z = z.unsqueeze(0)
 
         try:
-            actions = _format_actions(actions_raw, z.shape[0], f)
+            actions = _extract_actions(data, z.shape[0], f)
         except (RuntimeError, TypeError, ValueError) as e:
             print(f"Skipping {f}: {e}")
             continue
-        if actions.ndim == 2 and actions.shape[1] == 1 and torch.all(actions == actions.long().to(actions.dtype)):
-            actions = actions.squeeze(1)
+        if actions is None:
+            print(f"Skipping {f} because no actions were found.")
+            continue
+
+        game_name = _get_game_name(data, f)
+        if game_name not in samples_by_game:
+            unique_games.append(game_name)
 
         for sample_z, sample_action in zip(z, actions):
             samples_by_game[game_name].append((sample_z, sample_action, game_name))
+
+    if not samples_by_game:
+        raise RuntimeError(
+            f"No usable samples found under {base_name}/ ({base_dir}). "
+            "All files were missing actions or unreadable."
+        )
 
     min_count = min(len(samples) for samples in samples_by_game.values())
     if min_count < 2:
@@ -242,24 +312,24 @@ def evaluate_multiclass_model(model, loader, unique_games, device, target_index=
     }
     return total_accuracy, per_game_accuracy
 
-def load_data_per_game(test_ratio=0.2, seed=42, dataset='both'):
+def load_data_per_game(test_ratio=0.2, seed=42, dataset='both', dump_dir_idx=1):
     """Load data grouped by game. Returns dict: game_name -> (train_dataset, test_dataset, num_actions, action_mode)."""
+    base_name, base_dir = _resolve_dump_base_dir(dump_dir_idx)
     if dataset == 'both':
-        files = sorted(glob.glob('latent_actions_dump/*/*/*/*/latent_actions.pt'))
+        files = glob.glob(os.path.join(base_dir, "**", "latent_actions.pt"), recursive=True)
     else:
-        files = sorted(glob.glob(f'latent_actions_dump/{dataset}/*/*/*/latent_actions.pt'))
+        files = glob.glob(os.path.join(base_dir, dataset, "**", "latent_actions.pt"), recursive=True)
+    files = sorted(files)
     if not files:
-        raise RuntimeError('No latent_actions.pt files found under latent_actions_dump/.')
+        raise RuntimeError(f'No latent_actions.pt files found under {base_name}/ ({base_dir}).')
 
     samples_by_game = defaultdict(list)
 
     for f in files:
-        game_name = _get_game_name(f)
-        data = torch.load(f, map_location='cpu')
-
-        actions_raw = data.get('actions')
-        if actions_raw is None or len(actions_raw) == 0:
-            print(f"Skipping {f} because no actions were found.")
+        try:
+            data = torch.load(f, map_location='cpu')
+        except Exception as e:
+            print(f"Skipping {f}: failed to load ({e})")
             continue
 
         z = torch.as_tensor(data['z_mu'], dtype=torch.float32)
@@ -267,15 +337,24 @@ def load_data_per_game(test_ratio=0.2, seed=42, dataset='both'):
             z = z.unsqueeze(0)
 
         try:
-            actions = _format_actions(actions_raw, z.shape[0], f)
+            actions = _extract_actions(data, z.shape[0], f)
         except (RuntimeError, TypeError, ValueError) as e:
             print(f"Skipping {f}: {e}")
             continue
-        if actions.ndim == 2 and actions.shape[1] == 1 and torch.all(actions == actions.long().to(actions.dtype)):
-            actions = actions.squeeze(1)
+        if actions is None:
+            print(f"Skipping {f} because no actions were found.")
+            continue
+
+        game_name = _get_game_name(data, f)
 
         for sample_z, sample_action in zip(z, actions):
             samples_by_game[game_name].append((sample_z, sample_action))
+
+    if not samples_by_game:
+        raise RuntimeError(
+            f"No usable samples found under {base_name}/ ({base_dir}). "
+            "All files were missing actions or unreadable."
+        )
 
     rng = random.Random(seed)
     game_datasets = {}
@@ -392,6 +471,8 @@ def main():
                         help='Dimensions to zero out during training (e.g. --mask 0 3 5)')
     parser.add_argument('--dataset', type=str, default='both', choices=['adaworld', 'olafworld', 'both'],
                         help='Which dataset to train on (default: both)')
+    parser.add_argument('--dump-dir', type=int, choices=[1,2], default=1, dest='dump_dir',
+                        help='Which dump dir to use: 1 -> latent_actions_dump, 2 -> latent_actions_dump_2')
     parser.add_argument('--per_game', action='store_true',
                         help='Train a separate model for each game instead of a single shared model')
     args = parser.parse_args()
@@ -401,7 +482,7 @@ def main():
 
     if args.per_game:
         print("Loading per-game data...")
-        game_datasets = load_data_per_game(dataset=args.dataset)
+        game_datasets = load_data_per_game(dataset=args.dataset, dump_dir_idx=args.dump_dir)
         print(f"Games: {list(game_datasets.keys())}")
         per_game_results = train_per_game(game_datasets, args, device)
         print(f"\n{'='*60}")
@@ -413,8 +494,9 @@ def main():
         return
 
     print("Loading data...")
-    train_dataset, test_dataset, num_actions, unique_games, action_mode = load_data(dataset=args.dataset)
+    train_dataset, test_dataset, num_actions, unique_games, action_mode = load_data(dataset=args.dataset, dump_dir_idx=args.dump_dir)
     print(f"Train samples: {len(train_dataset)}, Test samples: {len(test_dataset)}")
+    print(f"Hidden layers (actions): {args.action_hidden_layers}, Hidden layers (game): {args.game_hidden_layers}")
     print(f"Games: {unique_games}")
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)

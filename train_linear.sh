@@ -5,7 +5,7 @@
 #SBATCH --job-name=train_linear
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --time=00:15:00
+#SBATCH --time=01:00:00
 #SBATCH --output=logs/train_linear_%A.out
 
 module purge
@@ -15,10 +15,9 @@ source activate adaworld
 
 
 python new_stuff/train_linear.py \
-    --epochs 100 \
+    --epochs 1000 \
     --batch_size 256 \
-    --action_hidden_layers 1 \
+    --action_hidden_layers 3 \
     --game_hidden_layers 0 \
     --dataset olafworld \
-    #--mask 7 11 15 17
-    #--dataset adaworld
+    --dump-dir 1 \

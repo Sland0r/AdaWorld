@@ -28,7 +28,11 @@ python extract_latent_actions.py --frame1 a.png --frame2 b.png --lam-ckpt /path/
 
 import argparse
 import glob
+import json as _json
+import gc
 import os
+import re
+import struct
 import sys
 from pathlib import Path
 
@@ -37,6 +41,23 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 from PIL import Image
+
+try:
+    from torchvision.io import read_video as torchvision_read_video
+except Exception:
+    torchvision_read_video = None
+
+try:
+    from google.protobuf.internal.decoder import _DecodeVarint
+    from google.protobuf.internal.wire_format import (
+        WIRETYPE_FIXED32,
+        WIRETYPE_FIXED64,
+        WIRETYPE_LENGTH_DELIMITED,
+        WIRETYPE_VARINT,
+    )
+    _HAS_PROTOBUF = True
+except ImportError:
+    _HAS_PROTOBUF = False
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 WORLDMODEL_DIR = SCRIPT_DIR.parent / "worldmodel"
@@ -68,6 +89,14 @@ LAM_CONFIG = dict(
     lam_dec_blocks=16,
     lam_num_heads=16,
 )
+
+# ---------------------------------------------------------------------------
+# P2P dataset label schema
+# ---------------------------------------------------------------------------
+# Keyboard keys with >9k frames in the dataset (sorted by frequency)
+P2P_KEYBOARD_KEYS = ["w", "d", "a", "LeftArrow", "LeftShift", "RightArrow", "s", "UpArrow", "f", "Space"]
+# Mouse button encoding: 0=left click, 1=right click, 2=no click
+P2P_MOUSE_BUTTON_NONE = 2
 
 
 # ========================== Model Loading ==================================
@@ -172,6 +201,165 @@ def load_image(path: str, resolution: int | tuple[int, int] = RESOLUTION) -> tor
     return torch.from_numpy(np.array(img)).float() / 255.0
 
 
+def _resize_frame_array(frame: np.ndarray, resolution: int | tuple[int, int]) -> torch.Tensor:
+    image = Image.fromarray(frame).convert("RGB")
+    if isinstance(resolution, tuple):
+        h, w = resolution
+        image = image.resize((w, h), Image.BICUBIC)
+    else:
+        image = image.resize((resolution, resolution), Image.BICUBIC)
+    return torch.from_numpy(np.array(image)).float() / 255.0
+
+
+def _read_video_file(path: str) -> list[torch.Tensor]:
+    """Decode a video file into RGB frame tensors using ffmpeg."""
+    import subprocess
+    import tempfile
+
+    try:
+        import cv2
+
+        cap = cv2.VideoCapture(path)
+        if cap.isOpened():
+            frames: list[torch.Tensor] = []
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frames.append(torch.from_numpy(frame))
+            cap.release()
+            if frames:
+                return frames
+    except Exception:
+        pass
+    
+    try:
+        # Use ffmpeg to extract frames as a sequence of PNG images piped to stdout
+        cmd = [
+            "ffmpeg",
+            "-i", path,
+            "-f", "image2pipe",
+            "-pix_fmt", "rgb24",
+            "-vcodec", "rawvideo",
+            "-"
+        ]
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        
+        frames = []
+        # Read raw RGB frames from ffmpeg stdout
+        # Each frame is W*H*3 bytes (24 bits per pixel)
+        # First, we need to get video dimensions
+        get_info_cmd = [
+            "ffprobe",
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height",
+            "-of", "csv=p=0",
+            path
+        ]
+        try:
+            info_output = subprocess.check_output(get_info_cmd, text=True).strip()
+            w, h = map(int, info_output.split(","))
+            frame_size = w * h * 3
+            
+            while True:
+                data = proc.stdout.read(frame_size)
+                if len(data) < frame_size:
+                    break
+                frame = np.frombuffer(data, dtype=np.uint8).reshape((h, w, 3))
+                frames.append(torch.from_numpy(frame))
+            
+            proc.wait()
+            if frames:
+                return frames
+        except Exception:
+            proc.kill()
+            raise
+    except Exception as exc:
+        raise RuntimeError(f"Unable to decode video file: {path}") from exc
+
+
+def _extract_annotation_strings(annotation_path: str) -> list[str]:
+    """Best-effort extraction of human-readable labels from a protobuf blob."""
+    try:
+        raw = Path(annotation_path).read_bytes().decode("latin1", errors="ignore")
+    except OSError:
+        return []
+
+    seen = set()
+    labels: list[str] = []
+    for candidate in re.findall(r"[ -~]{6,}", raw):
+        text = re.sub(r"^[^A-Za-z]+", "", candidate).strip()
+        if not text or text in seen:
+            continue
+        if text.startswith(("$", "LLM-", "gemini-", "scur", "scur0531")):
+            continue
+        if any(token in text.lower() for token in ("checkpoint", "thinking", "preview", "flash", "gemma")):
+            continue
+        if text.count(" ") < 2 and not text.startswith(("Avoid", "Get", "Engage", "Approach", "Eat", "Activate")):
+            continue
+        seen.add(text)
+        labels.append(text)
+    return labels
+
+
+def _load_video_annotations(video_path: str) -> tuple[list[tuple[str, ...]] | None, list[str] | None]:
+    annotation_path = os.path.join(os.path.dirname(video_path), "annotation.proto")
+    if not os.path.exists(annotation_path):
+        return None, None
+
+    labels = _extract_annotation_strings(annotation_path)
+    if not labels:
+        return None, None
+
+    action_names = labels
+    actions = [tuple(labels)]
+    return actions, action_names
+
+
+def _load_source_frames(
+    source_path: str,
+    resolution: int | tuple[int, int] = RESOLUTION,
+    start_frame: int = 0,
+    max_frames: int | None = None,
+    frame_skip: int = 1,
+) -> tuple[list[torch.Tensor], tuple[list[tuple[str, ...]] | None, list[str] | None] | None]:
+    if os.path.isfile(source_path):
+        if source_path.lower().endswith((".mp4", ".webm", ".mov", ".mkv", ".avi")):
+            frames = _read_video_file(source_path)
+            frames = frames[start_frame:]
+            frames = frames[::frame_skip]
+            if max_frames is not None:
+                frames = frames[:max_frames]
+            if len(frames) < 2:
+                raise ValueError(f"Need at least 2 frames in {source_path}, found {len(frames)}")
+            resized = [_resize_frame_array(frame.numpy(), resolution) for frame in frames]
+            return resized, _load_video_annotations(source_path)
+        raise FileNotFoundError(f"The path '{source_path}' is not a supported video file.")
+
+    if os.path.isdir(source_path):
+        video_candidates = []
+        for ext in ("*.mp4", "*.webm", "*.mov", "*.mkv", "*.avi"):
+            video_candidates.extend(glob.glob(os.path.join(source_path, ext)))
+        preferred = [p for p in video_candidates if os.path.basename(p) == "video.mp4"]
+        video_candidates = preferred or sorted(video_candidates)
+        if video_candidates:
+            return _load_source_frames(
+                video_candidates[0],
+                resolution=resolution,
+                start_frame=start_frame,
+                max_frames=max_frames,
+                frame_skip=frame_skip,
+            )
+
+    raise FileNotFoundError(f"The path '{source_path}' does not exist or is not a supported video source.")
+
+
 def load_video_frames(
     path: str,
     resolution: int | tuple[int, int] = RESOLUTION,
@@ -179,7 +367,7 @@ def load_video_frames(
     max_frames: int | None = None,
     frame_skip: int = 1,
 ) -> list[torch.Tensor]:
-    """Load frames from a video file **or** a directory of ordered images.
+    """Load frames from a video file, a directory of ordered images, or a video folder.
 
     Parameters
     ----------
@@ -221,26 +409,57 @@ def load_video_frames(
         import json
         actions_list = []
         action_names = []
-        actions_path = os.path.join(os.path.dirname(path), "actions.json")
-        info_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(path))), "info.json")
-        
-        if os.path.exists(actions_path) and os.path.exists(info_path):
+
+        # Robust search for actions/info files: walk up a few levels from the
+        # frame directory, then fallback to a shallow walk under the frame dir.
+        base_dir = os.path.dirname(path)
+        actions_path = None
+        info_path = None
+
+        cur = base_dir
+        for _ in range(6):
+            cand_a = os.path.join(cur, "actions.json")
+            cand_i = os.path.join(cur, "info.json")
+            if actions_path is None and os.path.exists(cand_a):
+                actions_path = cand_a
+            if info_path is None and os.path.exists(cand_i):
+                info_path = cand_i
+            if actions_path and info_path:
+                break
+            parent = os.path.dirname(cur)
+            if parent == cur:
+                break
+            cur = parent
+
+        # If not found, try a shallow walk under the base_dir (covers some dataset layouts).
+        if actions_path is None:
+            for root, dirs, files in os.walk(base_dir):
+                if "actions.json" in files:
+                    actions_path = os.path.join(root, "actions.json")
+                    break
+        if info_path is None:
+            for root, dirs, files in os.walk(base_dir):
+                if "info.json" in files:
+                    info_path = os.path.join(root, "info.json")
+                    break
+
+        if actions_path and info_path:
             with open(actions_path, 'r') as f:
                 all_actions = json.load(f).get("actions", [])
             with open(info_path, 'r') as f:
                 info_data = json.load(f)
                 captions = info_data.get("info", {}).get("action_captions", [])
                 action_names = [c[0] for c in captions if c]
-            
+
             original_indices = []
             for p in paths:
                 try:
                     original_indices.append(int(os.path.splitext(os.path.basename(p))[0]))
                 except ValueError:
                     original_indices.append(None)
-                    
+
             action_map = {a.get("src_id"): a.get("action") for a in all_actions}
-            
+
             for i in range(len(original_indices) - 1):
                 src = original_indices[i]
                 if src is not None:
@@ -250,8 +469,17 @@ def load_video_frames(
 
         frames = [load_image(p, resolution) for p in paths]
         return frames, (actions_list, action_names)
-    else:
-        raise FileNotFoundError(f"The path '{path}' does not exist or is not a directory. Video file parsing was removed or unsupported.")
+
+    frames, annotations = _load_source_frames(
+        path,
+        resolution=resolution,
+        start_frame=start_frame,
+        max_frames=max_frames,
+        frame_skip=frame_skip,
+    )
+    if annotations is not None:
+        return frames, annotations
+    return frames
 
 
 def load_frame_directory(
@@ -318,6 +546,7 @@ def extract_latent_actions_batch(
     mu_only: bool,
     device: str = "cuda",
     model_type: str = "adaworld",
+    batch_size: int = 16,
 ) -> list:
     """Extract latent actions for all consecutive pairs in *frames*.
 
@@ -326,12 +555,11 @@ def extract_latent_actions_batch(
     For OlafWorld, ``z_var`` is zeros (the encoder is deterministic).
     """
     results = []
-    batch_size = 128
+    n_pairs = len(frames) - 1
 
-    pairs = [torch.stack([frames[i], frames[i+1]], dim=0) for i in range(len(frames) - 1)]
-
-    for i in range(0, len(pairs), batch_size):
-        batch = pairs[i:i + batch_size]
+    for i in range(0, n_pairs, batch_size):
+        end = min(i + batch_size, n_pairs)
+        batch = [torch.stack([frames[j], frames[j + 1]], dim=0) for j in range(i, end)]
         video_batch = torch.stack(batch, dim=0).to(device)  # (B, 2, H, W, C)
 
         if model_type == "olafworld":
@@ -360,6 +588,12 @@ def extract_latent_actions_batch(
                         "z_var": outputs["z_var"][j].cpu(),
                         "z_rep": outputs["z_rep"][j].cpu(),
                     })
+
+        del batch, video_batch
+        if model_type == "olafworld":
+            del z
+        else:
+            del outputs
 
     return results
 
@@ -421,6 +655,353 @@ def save_results(
     print(f"  z_mu.csv           — z_mu values as CSV")
 
 
+# ========================== P2P Dataset =====================================
+
+
+def _decode_raw_proto(data: bytes, max_depth: int = 8) -> dict:
+    """Recursively decode raw protobuf binary data into a dict with field_N keys."""
+    if not _HAS_PROTOBUF:
+        raise RuntimeError("google.protobuf is required for P2P proto decoding")
+    if max_depth <= 0:
+        return {"_truncated": f"{len(data)} bytes (max depth)"}
+
+    pos = 0
+    result: dict = {}
+
+    def _add(key, value):
+        if key not in result:
+            result[key] = value
+        else:
+            existing = result[key]
+            if isinstance(existing, list):
+                existing.append(value)
+            else:
+                result[key] = [existing, value]
+
+    while pos < len(data):
+        try:
+            tag, new_pos = _DecodeVarint(data, pos)
+            fn = tag >> 3
+            wt = tag & 0x7
+            if fn == 0 or fn > 536870911:
+                break
+            pos = new_pos
+            key = f"field_{fn}"
+
+            if wt == WIRETYPE_VARINT:
+                value, pos = _DecodeVarint(data, pos)
+                _add(key, value)
+            elif wt == WIRETYPE_FIXED64:
+                value = struct.unpack("<d", data[pos:pos + 8])[0]
+                pos += 8
+                _add(key, round(value, 8))
+            elif wt == WIRETYPE_LENGTH_DELIMITED:
+                length, pos = _DecodeVarint(data, pos)
+                if length > len(data) - pos:
+                    break
+                raw = data[pos:pos + length]
+                pos += length
+                try:
+                    text = raw.decode("utf-8")
+                    if all(c.isprintable() or c in "\n\r\t" for c in text):
+                        _add(key, text)
+                        continue
+                except (UnicodeDecodeError, ValueError):
+                    pass
+                try:
+                    sub = _decode_raw_proto(raw, max_depth - 1)
+                    if sub:
+                        _add(key, sub)
+                    else:
+                        _add(key, f"<{len(raw)} bytes binary>")
+                except Exception:
+                    _add(key, f"<{len(raw)} bytes binary>")
+            elif wt == WIRETYPE_FIXED32:
+                value = struct.unpack("<f", data[pos:pos + 4])[0]
+                pos += 4
+                _add(key, round(value, 6))
+            else:
+                break
+        except Exception:
+            break
+
+    return result
+
+
+def _proto_ensure_list(val):
+    """Wrap a single value in a list; leave lists untouched."""
+    if val is None:
+        return []
+    return val if isinstance(val, list) else [val]
+
+
+def _extract_keyboard_keys_from_action(action_raw: dict) -> list[str]:
+    """Extract keyboard key names from a frame's field_1 (user_action) sub-message."""
+    if not isinstance(action_raw, dict):
+        return []
+    kb_raw = action_raw.get("field_2")
+    if kb_raw is None:
+        return []
+    if isinstance(kb_raw, str):
+        keys = [k.strip() for k in kb_raw.replace("\n", "").split(",") if k.strip()]
+        return keys
+    if isinstance(kb_raw, dict):
+        vals = kb_raw.get("field_1", [])
+        return _proto_ensure_list(vals)
+    return []
+
+
+def _extract_mouse_from_action(action_raw: dict) -> tuple[float, float, float, int]:
+    """Extract mouse data from a frame's field_1 (user_action) sub-message.
+
+    Returns (mouse_absolute_px, mouse_absolute_py, scroll_delta_px, button).
+    button: 0=left, 1=right, 2=none.
+    """
+    if not isinstance(action_raw, dict):
+        return 0.0, 0.0, 0.0, P2P_MOUSE_BUTTON_NONE
+    mouse_raw = action_raw.get("field_4")
+    if not isinstance(mouse_raw, dict):
+        return 0.0, 0.0, 0.0, P2P_MOUSE_BUTTON_NONE
+
+    px = float(mouse_raw.get("field_1", 0))
+    py = float(mouse_raw.get("field_2", 0))
+    scroll = float(mouse_raw.get("field_3", 0))
+    buttons = _proto_ensure_list(mouse_raw.get("field_4"))
+    if not buttons:
+        button = P2P_MOUSE_BUTTON_NONE
+    elif 1 in buttons:
+        button = 1  # right click
+    elif 0 in buttons:
+        button = 0  # left click
+    else:
+        button = P2P_MOUSE_BUTTON_NONE
+    return px, py, scroll, button
+
+
+def extract_p2p_labels(proto_path: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict, int]:
+    """Decode annotation.proto and extract per-frame keyboard + mouse labels.
+
+    Returns
+    -------
+    keyboard_labels : (N, 10) int tensor — binary indicators for P2P_KEYBOARD_KEYS
+    mouse_floats : (N, 3) float tensor — [px, py, scroll_delta]
+    mouse_buttons : (N,) int tensor — 0=left, 1=right, 2=none
+    metadata : dict — id, timestamp, user, fps, env
+    n_frames : int — number of frame annotations in the proto
+    """
+    with open(proto_path, "rb") as f:
+        data = f.read()
+    decoded = _decode_raw_proto(data)
+
+    # Extract metadata from field_2
+    meta_raw = decoded.get("field_2", {})
+    env_raw = meta_raw.get("field_6", {}) if isinstance(meta_raw, dict) else {}
+    metadata = {
+        "id": meta_raw.get("field_1", "") if isinstance(meta_raw, dict) else "",
+        "timestamp": meta_raw.get("field_2", 0) if isinstance(meta_raw, dict) else 0,
+        "user": meta_raw.get("field_3", "") if isinstance(meta_raw, dict) else "",
+        "fps": meta_raw.get("field_5", 0) if isinstance(meta_raw, dict) else 0,
+        "env": {
+            "platform": env_raw.get("field_1", "") if isinstance(env_raw, dict) else "",
+            "game": env_raw.get("field_2", "") if isinstance(env_raw, dict) else "",
+        },
+    }
+
+    # Extract frame annotations from field_3
+    raw_frames = _proto_ensure_list(decoded.get("field_3"))
+    n_frames = len(raw_frames)
+
+    key_to_idx = {k: i for i, k in enumerate(P2P_KEYBOARD_KEYS)}
+    n_keys = len(P2P_KEYBOARD_KEYS)
+
+    keyboard_labels = torch.zeros(n_frames, n_keys, dtype=torch.int)
+    mouse_floats = torch.zeros(n_frames, 3, dtype=torch.float)
+    mouse_buttons = torch.full((n_frames,), P2P_MOUSE_BUTTON_NONE, dtype=torch.int)
+
+    for i, frame in enumerate(raw_frames):
+        if not isinstance(frame, dict):
+            continue
+        action_raw = frame.get("field_1", {})
+
+        # Keyboard
+        keys = _extract_keyboard_keys_from_action(action_raw)
+        for k in keys:
+            idx = key_to_idx.get(k)
+            if idx is not None:
+                keyboard_labels[i, idx] = 1
+
+        # Mouse
+        px, py, scroll, button = _extract_mouse_from_action(action_raw)
+        mouse_floats[i, 0] = px
+        mouse_floats[i, 1] = py
+        mouse_floats[i, 2] = scroll
+        mouse_buttons[i] = button
+
+    return keyboard_labels, mouse_floats, mouse_buttons, metadata, n_frames
+
+
+def _run_batch_p2p(
+    args: argparse.Namespace,
+    model,
+    model_type: str = "adaworld",
+) -> list:
+    """Process all folders in the open-p2p-subset dataset.
+
+    For each folder:
+      1. Check annotation.proto exists
+      2. Decode proto → frame annotations count
+      3. Read video.mp4 → video frame count
+      4. Validate counts match
+      5. Extract latent actions from consecutive frame pairs
+      6. Extract keyboard + mouse labels from proto
+      7. Save to <save-dir>/<model_type>/<uuid>/latent_actions.pt
+    """
+    p2p_dir = os.path.abspath(args.p2p_dir)
+    save_root = args.save_dir if args.save_dir else "./latent_actions_dump"
+
+    folders = sorted([
+        d for d in os.listdir(p2p_dir)
+        if os.path.isdir(os.path.join(p2p_dir, d))
+    ])
+
+    total = len(folders)
+    success = 0
+    skipped = 0
+    failed = 0
+
+    print(f"P2P batch mode: found {total} folder(s) in {p2p_dir}")
+    print(f"Saving outputs under: {save_root}/{model_type}/...")
+    print(f"Keyboard keys tracked ({len(P2P_KEYBOARD_KEYS)}): {P2P_KEYBOARD_KEYS}")
+    print()
+
+    for idx, folder in enumerate(folders, start=1):
+        folder_path = os.path.join(p2p_dir, folder)
+        proto_path = os.path.join(folder_path, "annotation.proto")
+        video_path = os.path.join(folder_path, "video.mp4")
+        run_save_dir = os.path.join(save_root, model_type, folder)
+        out_pt = os.path.join(run_save_dir, "latent_actions.pt")
+
+        # Skip if already processed
+        if os.path.exists(out_pt):
+            if not args.quiet:
+                print(f"[{idx}/{total}] Skipping existing: {folder}")
+            skipped += 1
+            continue
+
+        # Check proto exists
+        if not os.path.isfile(proto_path):
+            print(f"[{idx}/{total}] SKIP (no annotation.proto): {folder}", file=sys.stderr)
+            skipped += 1
+            continue
+
+        # Check video exists
+        if not os.path.isfile(video_path):
+            print(f"[{idx}/{total}] SKIP (no video.mp4): {folder}", file=sys.stderr)
+            skipped += 1
+            continue
+
+        try:
+            # 1. Extract labels from proto
+            keyboard_labels, mouse_floats, mouse_buttons, metadata, n_proto_frames = \
+                extract_p2p_labels(proto_path)
+
+            # 2. Read video frames
+            frames = _read_video_file(video_path)
+            n_video_frames = len(frames)
+
+            # 3. Validate frame count
+            if n_proto_frames != n_video_frames:
+                print(
+                    f"[{idx}/{total}] WARNING frame mismatch in {folder}: "
+                    f"proto={n_proto_frames} video={n_video_frames}. "
+                    f"Using min({n_proto_frames}, {n_video_frames}).",
+                    file=sys.stderr,
+                )
+                n_use = min(n_proto_frames, n_video_frames)
+                frames = frames[:n_use]
+                keyboard_labels = keyboard_labels[:n_use]
+                mouse_floats = mouse_floats[:n_use]
+                mouse_buttons = mouse_buttons[:n_use]
+
+            if len(frames) < 2:
+                print(f"[{idx}/{total}] SKIP (< 2 frames): {folder}", file=sys.stderr)
+                skipped += 1
+                continue
+
+            # 4. Resize frames in-place to avoid keeping two full frame lists in memory.
+            resolution = args.resolution
+            for i_frame, frame in enumerate(frames):
+                frames[i_frame] = _resize_frame_array(frame.numpy(), resolution)
+            gc.collect()
+
+            # 5. Extract latent actions
+            results = extract_latent_actions_batch(
+                model, frames, args.mu_only,
+                device=args.device, model_type=model_type, batch_size=args.batch_size,
+            )
+
+            # 6. Build save dict
+            # Labels: use frame_i's label for pair (frame_i, frame_{i+1})
+            # So labels go from index 0 to N-2 (N-1 pairs)
+            kb_labels_pairs = keyboard_labels[:-1]  # (N-1, 10)
+            mf_pairs = mouse_floats[:-1]            # (N-1, 3)
+            mb_pairs = mouse_buttons[:-1]            # (N-1,)
+
+            if args.mu_only:
+                all_mu = torch.stack(results)
+                save_dict = {"z_mu": all_mu, "z_var": None, "z_rep": None}
+            else:
+                all_mu = torch.stack([r["z_mu"] for r in results])
+                all_var = torch.stack([r["z_var"] for r in results])
+                all_rep = torch.stack([r["z_rep"] for r in results])
+                save_dict = {"z_mu": all_mu, "z_var": all_var, "z_rep": all_rep}
+
+            save_dict["keyboard_labels"] = kb_labels_pairs
+            save_dict["keyboard_keys"] = P2P_KEYBOARD_KEYS
+            save_dict["mouse_floats"] = mf_pairs
+            save_dict["mouse_buttons"] = mb_pairs
+            save_dict["metadata"] = metadata
+            save_dict["game_name"] = metadata.get("env", {}).get("game", folder)
+
+            # 7. Save
+            os.makedirs(run_save_dir, exist_ok=True)
+            torch.save(save_dict, out_pt)
+
+            # Also save z_mu CSV
+            z_mu_for_csv = save_dict["z_mu"]
+            np.savetxt(
+                os.path.join(run_save_dir, "z_mu.csv"),
+                z_mu_for_csv.numpy(),
+                delimiter=",",
+                header=",".join([f"dim_{i}" for i in range(z_mu_for_csv.shape[1])]),
+            )
+
+            if not args.quiet:
+                print(
+                    f"[{idx}/{total}] OK {folder}: "
+                    f"{len(results)} pairs, "
+                    f"game={metadata['env'].get('game', '?')}"
+                )
+            del frames, results, save_dict
+            gc.collect()
+            success += 1
+
+        except Exception as exc:
+            exc_str = str(exc)
+            if "inline_container.cc" in exc_str or "iostream error" in exc_str:
+                print(f"[{idx}/{total}] oom error {folder}", file=sys.stderr)
+            else:
+                print(f"[{idx}/{total}] ERROR on {folder}: {exc}", file=sys.stderr)
+            import traceback
+            traceback.print_exc(file=sys.stderr)
+            failed += 1
+
+    print(f"\nP2P batch complete. total={total} success={success} skipped={skipped} failed={failed}")
+    if failed > 0:
+        sys.exit(1)
+    return []
+
+
 # ========================== CLI =============================================
 
 
@@ -442,6 +1023,10 @@ def parse_args() -> argparse.Namespace:
     )
     group.add_argument(
         "--frame-dir", type=str, help="Directory of frame images (sorted alphabetically)."
+    )
+    group.add_argument(
+        "--p2p-dir", type=str,
+        help="Path to the open-p2p-subset directory. Extracts latent actions + keyboard/mouse labels from annotation.proto."
     )
 
     p.add_argument("--frame2", type=str, help="Path to the second frame image.")
@@ -469,6 +1054,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--save-dir", type=str, default=None, help="Directory to save results (optional).")
     p.add_argument("--quiet", action="store_true", help="Suppress per-pair printing.")
     p.add_argument("--mu_only", action='store_true', help='Only save mean of the VAE')
+    p.add_argument(
+        "--batch-size",
+        type=int,
+        default=16,
+        help="Pair batch size for latent extraction (default: 16; lower uses less memory).",
+    )
 
     return p.parse_args()
 
@@ -483,6 +1074,14 @@ def _find_run_frame_dirs(root_dir: str) -> list[str]:
     run_dirs = [p for p in run_dirs if len(Path(os.path.relpath(p, root_dir)).parts) >= 3]
     run_dirs.sort()
     return run_dirs
+
+
+def _find_run_video_files(root_dir: str) -> list[str]:
+    """Find nested canonical video files under a dataset root."""
+    pattern = os.path.join(root_dir, "**", "video.mp4")
+    video_files = [p for p in glob.glob(pattern, recursive=True) if os.path.isfile(p)]
+    video_files.sort()
+    return video_files
 
 
 def _extract_single_source(
@@ -504,7 +1103,14 @@ def _extract_single_source(
         frames, (actions, action_names) = video_out
     else:
         frames = video_out
-    results = extract_latent_actions_batch(model, frames, args.mu_only, device=args.device, model_type=model_type)
+    results = extract_latent_actions_batch(
+        model,
+        frames,
+        args.mu_only,
+        device=args.device,
+        model_type=model_type,
+        batch_size=args.batch_size,
+    )
     return results, actions, action_names
 
 
@@ -559,12 +1165,63 @@ def _run_batch_game_root(args: argparse.Namespace, model, model_type: str = "ada
     return []
 
 
+def _run_batch_video_root(args: argparse.Namespace, model, model_type: str = "adaworld") -> list:
+    """Process all nested video.mp4 files under a dataset root."""
+    root_dir = os.path.abspath(args.video)
+    run_video_files = _find_run_video_files(root_dir)
+
+    if not run_video_files:
+        print(f"No video files found under {root_dir} (expected nested video.mp4 files).", file=sys.stderr)
+        sys.exit(1)
+
+    save_root = args.save_dir if args.save_dir else "./latent_actions_dump"
+    total = len(run_video_files)
+    success = 0
+    failed = 0
+
+    print(f"Batch mode: found {total} video(s) under {root_dir}")
+    print(f"Saving outputs under: {save_root}/...")
+
+    for idx, video_path in enumerate(run_video_files, start=1):
+        rel = os.path.relpath(video_path, root_dir)
+        rel_run = os.path.dirname(rel)
+        if rel_run in ("", "."):
+            rel_run = os.path.basename(os.path.normpath(root_dir))
+        run_id = rel_run
+        run_save_dir = os.path.join(save_root, model_type, rel_run)
+        out_pt = os.path.join(run_save_dir, "latent_actions.pt")
+
+        if os.path.exists(out_pt):
+            print(f"[{idx}/{total}] Skipping existing: {run_id}")
+            success += 1
+            continue
+
+        print(f"[{idx}/{total}] Processing: {run_id}")
+        try:
+            results, actions, action_names = _extract_single_source(model, video_path, args, model_type=model_type)
+            save_results(results, run_save_dir, args.mu_only, actions=actions, action_names=action_names)
+            success += 1
+        except Exception as exc:
+            print(f"[{idx}/{total}] ERROR on {run_id}: {exc}", file=sys.stderr)
+            failed += 1
+
+    print(f"Batch complete. total={total} success={success} failed={failed}")
+    if failed > 0:
+        sys.exit(1)
+
+    return []
+
+
 def main() -> None:
     args = parse_args()
 
     # --- Validate args ---
     if args.frame1 and not args.frame2:
         print("ERROR: --frame2 is required when using --frame1", file=sys.stderr)
+        sys.exit(1)
+
+    if args.batch_size < 1:
+        print("ERROR: --batch-size must be >= 1", file=sys.stderr)
         sys.exit(1)
 
     # --- Load model ---
@@ -576,11 +1233,18 @@ def main() -> None:
     else:
         model = load_lam(args.lam_ckpt, device=args.device)
 
+    # --- P2P dataset batch mode ---
+    if hasattr(args, 'p2p_dir') and args.p2p_dir:
+        return _run_batch_p2p(args, model, model_type=model_type)
+
     # --- Batch mode for game root directories ---
     if args.video and os.path.isdir(args.video):
         run_frame_dirs = _find_run_frame_dirs(args.video)
         if run_frame_dirs:
             return _run_batch_game_root(args, model, model_type=model_type)
+        run_video_files = _find_run_video_files(args.video)
+        if run_video_files:
+            return _run_batch_video_root(args, model, model_type=model_type)
 
     # --- Load frames ---
     actions, action_names = None, None
@@ -617,7 +1281,14 @@ def main() -> None:
         sys.exit(1)
 
     # --- Extract ---
-    results = extract_latent_actions_batch(model, frames, args.mu_only, device=args.device, model_type=model_type)
+    results = extract_latent_actions_batch(
+        model,
+        frames,
+        args.mu_only,
+        device=args.device,
+        model_type=model_type,
+        batch_size=args.batch_size,
+    )
 
     print(f"\n{'='*60}")
     print(f"  Summary: extracted {len(results)} latent action(s)")

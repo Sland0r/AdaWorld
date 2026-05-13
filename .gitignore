@@ -1,5 +1,5 @@
-logs
+logs*
 __pycache__
 lam.ckpt
-latent_actions_dump
+latent_actions_dump*
 *_plots

@@ -15,12 +15,13 @@ PYTHON=~/.conda/envs/adaworld/bin/python
 export PYTHONNOUSERSITE=1
 export PYTHONPATH=""
 
-VIDEO_PATH=/home/scur0531/random_actions_data/dataset/retro_act_v0.0.0_random
+#VIDEO_PATH=/home/scur0531/random_actions_data/dataset/retro_act_v0.0.0_random
+VIDEO_PATH=/scratch-shared/FoMo-Atomic-Actions/open-p2p-subset
 $PYTHON new_stuff/extract_latent_actions.py --video $VIDEO_PATH \
 	--quiet \
 	--mu_only \
-	--save-dir ./latent_actions_dump \
-	--model adaworld \
+	--save-dir ./latent_actions_dump_2 \
+	--model olafworld \
 
 
 # PATH CAN BE EITHER MP4 OR FOLDER OF FRAMES

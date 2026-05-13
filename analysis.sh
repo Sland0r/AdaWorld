@@ -1,6 +1,7 @@
 #!/bin/bash
 
-#SBATCH --partition=staging
+#SBATCH --partition=gpu_h100
+#SBATCH --gpus=1
 #SBATCH --job-name=analysis
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -15,4 +16,5 @@ export PYTHONNOUSERSITE=1
 export PYTHONPATH=""
 
 $PYTHON new_stuff/analysis.py \
-    --dump-dir olafworld
+    --dataset adaworld \
+    --dump-dir 2 \
