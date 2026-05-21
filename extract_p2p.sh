@@ -21,4 +21,4 @@ $PYTHON new_stuff/extract_latent_actions.py \
     --mu_only \
     --batch-size 8 \
     --save-dir ./latent_actions_dump_2 \
-    --model adaworld
+    --model olafworld

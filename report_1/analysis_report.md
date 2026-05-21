@@ -277,7 +277,52 @@ The wide range (0.007 to 0.973) shows that model agreement is highly game-depend
 
 ---
 
-## 12. Summary of Key Findings
+## 12. Visual Prediction from Latents vs Random Tensors
+
+To further characterise *what* information the latent action space encodes, we trained decoders to predict four visual targets from the 32-dimensional latent vectors (retro setting, ~280K aligned samples). Each experiment was run twice: once with the actual latent actions, and once replacing them with random tensors of the same shape (baseline). If the latent space carries information about a given target, the latent-based decoder should substantially outperform the random baseline.
+
+### 12.1 Experimental Setup
+
+| Target | Output Shape | Decoder | Train / Test |
+|---|---|---|---|
+| **Color histograms** | 768-d vector | Linear probe | 224,560 / 56,139 |
+| **Image blocks** (undersampled frame colours) | 3,072-d vector | Linear probe | 224,560 / 56,139 |
+| **Frame differences** (raw pixel diff between consecutive frames) | 3 × 256 × 256 | CNN (3.87M params) | 224,288 / 56,072 |
+| **Optical flow** | 2 × 256 × 256 | CNN (3.87M params) | 224,288 / 56,071 |
+
+All models were trained for 100 epochs with MSE loss.
+
+### 12.2 Results
+
+| Target | Latent MSE | Random MSE | Ratio (Random / Latent) | Improvement |
+|---|---|---|---|---|
+| **Color histograms** | 0.000017 | 0.000052 | **3.1×** | Latents encode colour statistics |
+| **Image blocks** | 0.031 | 0.116 | **3.7×** | Latents encode coarse visual appearance |
+| **Frame differences** | 348.42 | 352.51 | **1.01×** | Negligible — no dynamics information |
+| **Optical flow** | 2.708 | 2.716 | **1.003×** | Negligible — no motion information |
+
+### 12.3 Interpretation
+
+> [!IMPORTANT]
+> The latent actions strongly encode **static visual appearance** (colour, spatial layout) but carry **no meaningful information about inter-frame dynamics** (pixel differences, motion fields).
+
+**Static appearance is well-encoded.** For colour histograms and image blocks, latent-based decoders achieve 3–4× lower MSE than random-tensor baselines. A simple linear probe suffices to extract this information, confirming that colour and coarse spatial structure are linearly accessible from the latent representation. This is consistent with the near-perfect game identification accuracy (99%+) observed in Section 8 — the latent space captures *which game and scene* the frame belongs to.
+
+**Inter-frame dynamics are not encoded.** For frame differences and optical flow, the latent-based CNN decoders perform almost identically to those trained on random noise (1.2% and 0.3% improvement respectively). Even with a 3.87M-parameter CNN decoder and 100 training epochs, the latents provide no useful gradient signal for predicting how the frame changes between timesteps. This is particularly significant because frame differences and optical flow are precisely the visual quantities most closely tied to *which action was taken* — if the latent space encoded action semantics, these targets should be predictable.
+
+**Convergence behaviour confirms the finding.** The CNN decoders for flow and difference essentially plateaued within the first few epochs (flow: training loss went from ~2.65 to ~2.40 over 100 epochs; difference: from ~353 to ~347), showing the same flat loss trajectory for both latent and random inputs. The decoders learned a data-prior (average frame difference / average flow) rather than leveraging input-specific information.
+
+### 12.4 Connection to Prior Findings
+
+This experiment closes the loop on the central question of the report. The latent action space:
+1. **Encodes game/scene identity** → confirmed by 99% game classification (Section 8) and 3–4× advantage on colour/appearance prediction
+2. **Does not encode action semantics** → confirmed by near-chance action classification (Sections 7–8) and zero advantage on dynamics/flow prediction
+
+The latent representation is best understood as a **static visual fingerprint** — it tells you *what the frame looks like*, not *what happened between frames*.
+
+---
+
+## 13. Summary of Key Findings
 
 | Metric | AdaWorld | OlafWorld | Winner |
 |---|---|---|---|
@@ -291,10 +336,12 @@ The wide range (0.007 to 0.973) shows that model agreement is highly game-depend
 | MLP game acc (retro) | 99.3% | 99.3% | Tied |
 | Entanglement ratio (P2P) | 1.009 | 0.981 | OlafWorld (marginally) |
 | Entanglement ratio (retro) | 1.460 | 1.412 | OlafWorld (marginally) |
+| Appearance prediction (latent vs random) | 3.1–3.7× better | 3.1–3.7× better | — (model-agnostic test) |
+| Dynamics prediction (latent vs random) | ~1× (no gain) | ~1× (no gain) | — (model-agnostic test) |
 
 ---
 
-## 13. Conclusions
+## 14. Conclusions
 
 ### The latent action space is not about actions
 
@@ -306,6 +353,7 @@ Evidence:
 2. **Fisher scores are uniformly below 0.3** on all dimensions and PCs — within-class variance (variation across frames with the *same* action label) dwarfs between-class variance.
 3. **Entanglement ratios ≈ 1.0–1.5**: the latent space is more sensitive to game switches than action switches.
 4. **Centroids cluster by game, not by action**: in the retro setting, all 6 action centroids are within L2 distance 0.10 of each other, while game-switch distances are orders of magnitude larger.
+5. **Visual prediction experiments** (Section 12): latents predict static appearance 3–4× better than random noise, but provide zero advantage for predicting frame differences or optical flow — the dynamic signals most tied to action identity.
 
 ### AdaWorld has a severely collapsed representation
 
@@ -319,8 +367,9 @@ OlafWorld uses 10–20 active dimensions and achieves consistently better (thoug
 
 The representation is best described as a **compressed visual state summary**:
 - It captures game identity almost perfectly
-- It encodes broad visual dynamics (which game, which scene)
+- It encodes colour statistics and coarse spatial layout (3–4× better than random baselines, Section 12)
 - It partially captures directional movement (`LeftArrow` and `RightArrow` are the most separated actions in both models)
+- It fails to encode inter-frame dynamics: optical flow and frame differences are no more predictable from latents than from random noise (Section 12)
 - It fails to encode abstract action semantics
 
 ### CKA reveals game-dependent agreement

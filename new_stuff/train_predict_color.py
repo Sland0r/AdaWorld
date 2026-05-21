@@ -52,9 +52,20 @@ def load_latent_actions(base_dir):
     return torch.cat(all_z, dim=0)
 
 
-def load_color_histograms(base_dir, num_samples):
-    """Load color histogram features from .npz files.
+def load_color_histograms(base_dir, num_samples, cache_dir='/scratch-shared/FoMo-Atomic-Actions/_cache'):
+    """Load color histogram features.
+    Uses pre-cached .pt file if available, otherwise falls back to individual .npz files.
     Color dump has N+1 frames, we take histograms [1:] to skip first frame."""
+    cache_path = os.path.join(cache_dir, 'color_histograms.pt')
+    if os.path.exists(cache_path):
+        print(f"  Loading from cache: {cache_path}")
+        histograms = torch.load(cache_path, map_location='cpu')
+        # Skip first frame (index 0), take next num_samples
+        histograms = histograms[1:num_samples+1]
+        return histograms
+
+    # Fallback: load individual files
+    print("  Cache not found, loading individual .npz files (slow)...")
     files = sorted(glob.glob(os.path.join(base_dir, "**", "*.npz"), recursive=True))
     if not files:
         raise RuntimeError(f"No .npz files found in {base_dir}")
@@ -70,7 +81,7 @@ def load_color_histograms(base_dir, num_samples):
     
     if not histograms:
         raise RuntimeError(f"No usable color histograms found in {base_dir}")
-    return torch.stack(histograms, dim=0)[:num_samples]  # Ensure exactly num_samples
+    return torch.stack(histograms, dim=0)[:num_samples]
 
 
 def main():
@@ -82,6 +93,7 @@ def main():
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--dump_dir', type=int, choices=[1, 2], default=1, help='1=latent_actions_dump, 2=latent_actions_dump_2')
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--baseline', action='store_true', help='Use random inputs instead of latent actions')
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -98,6 +110,10 @@ def main():
     print("Loading latent actions...")
     z = load_latent_actions(latent_base)
     print(f"Loaded {z.shape[0]} latent vectors, dim={z.shape[1]}")
+
+    if args.baseline:
+        print("BASELINE MODE: replacing latent actions with random tensors")
+        z = torch.randn_like(z)
 
     print("Loading color histogram targets...")
     color = load_color_histograms(color_base, z.shape[0])

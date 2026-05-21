@@ -34,8 +34,16 @@ def _get_game_name(data, path):
 
 
 def _format_actions(actions, num_samples, file_path):
+    desc_map = {}
     if isinstance(actions, list) and len(actions) > 0 and isinstance(actions[0], dict):
         if 'action' in actions[0]:
+            for a in actions:
+                if 'desc' in a:
+                    try:
+                        idx = a['action'].index(1)
+                        desc_map[idx] = a['desc']
+                    except ValueError:
+                        pass
             actions = [a['action'] for a in actions]
     actions = torch.as_tensor(actions)
     if actions.ndim == 0:
@@ -44,11 +52,11 @@ def _format_actions(actions, num_samples, file_path):
         raise ValueError(
             f"Action count mismatch in {file_path}: z_mu has {num_samples} samples but actions has shape {tuple(actions.shape)}"
         )
-    return actions
+    return actions, desc_map
 
 
-def _resolve_dump_base_dir(dump_dir_idx):
-    base_name = 'latent_actions_dump' if dump_dir_idx == 1 else 'latent_actions_dump_2'
+def _resolve_dump_base_dir():
+    base_name = 'latent_actions_skipped'
     repo_root = Path(__file__).resolve().parents[1]
     return base_name, str(repo_root / base_name)
 
@@ -63,14 +71,14 @@ def _extract_actions(data, num_samples, file_path):
             has_dense_actions = True
 
     if has_dense_actions:
-        actions = _format_actions(actions_raw, num_samples, file_path)
+        actions, desc_map = _format_actions(actions_raw, num_samples, file_path)
         if actions.ndim == 2 and actions.shape[1] == 1 and torch.all(actions == actions.long().to(actions.dtype)):
             actions = actions.squeeze(1)
-        return actions
+        return actions, desc_map
 
     keyboard_labels = data.get('keyboard_labels')
     if keyboard_labels is None:
-        return None
+        return None, {}
 
     keyboard_labels = torch.as_tensor(keyboard_labels)
     if keyboard_labels.ndim == 1:
@@ -96,7 +104,7 @@ def _extract_actions(data, num_samples, file_path):
         mouse_left_right[:, 0] = (mouse_buttons == 0).to(torch.float32)
         mouse_left_right[:, 1] = (mouse_buttons == 1).to(torch.float32)
 
-    return torch.cat([keyboard_labels, mouse_left_right], dim=1)
+    return torch.cat([keyboard_labels, mouse_left_right], dim=1), {}
 
 
 def _build_dataset(samples):
@@ -106,8 +114,65 @@ def _build_dataset(samples):
     return z, actions, games
 
 
-def load_data(test_ratio=0.2, seed=42, dataset='both', dump_dir_idx=1):
-    base_name, base_dir = _resolve_dump_base_dir(dump_dir_idx)
+def _filter_and_remap_actions(samples, desc_map, exclude_actions):
+    """Filter out samples whose action label is in exclude_actions and remap indices."""
+    if not exclude_actions:
+        return samples, desc_map
+
+    # Build set of action indices to exclude based on description
+    exclude_indices = set()
+    for idx, desc in desc_map.items():
+        if desc in exclude_actions:
+            exclude_indices.add(idx)
+    if not exclude_indices:
+        print(f"Warning: none of {exclude_actions} matched any action descriptions in desc_map: {desc_map}")
+        return samples, desc_map
+
+    print(f"Excluding actions: {exclude_actions} (indices: {sorted(exclude_indices)})")
+
+    # Filter samples: keep only those whose action index is not excluded
+    filtered = []
+    for sample in samples:
+        action = sample[1]
+        if action.ndim == 0 or (action.ndim == 1 and action.shape[0] == 1):
+            action_idx = int(action.item())
+        elif action.ndim == 1 and torch.all((action == 0) | (action == 1)) and action.sum() == 1:
+            action_idx = int(action.argmax().item())
+        else:
+            action_idx = None
+        if action_idx is not None and action_idx in exclude_indices:
+            continue
+        filtered.append(sample)
+
+    print(f"Filtered {len(samples)} -> {len(filtered)} samples")
+
+    # Build remapping: old index -> new contiguous index
+    kept_indices = sorted(set(range(max(desc_map.keys()) + 1)) - exclude_indices) if desc_map else []
+    remap = {old: new for new, old in enumerate(kept_indices)}
+    new_desc_map = {remap[old]: desc for old, desc in desc_map.items() if old in remap}
+
+    # Remap actions in filtered samples
+    remapped = []
+    for sample in filtered:
+        action = sample[1]
+        if action.ndim == 0 or (action.ndim == 1 and action.shape[0] == 1):
+            old_idx = int(action.item())
+            new_action = torch.tensor(remap[old_idx], dtype=action.dtype)
+            remapped.append((sample[0], new_action) + sample[2:])
+        elif action.ndim == 1 and torch.all((action == 0) | (action == 1)) and action.sum() == 1:
+            old_idx = int(action.argmax().item())
+            new_onehot = torch.zeros(len(kept_indices), dtype=action.dtype)
+            new_onehot[remap[old_idx]] = 1
+            remapped.append((sample[0], new_onehot) + sample[2:])
+        else:
+            remapped.append(sample)
+
+    print(f"Kept actions: {new_desc_map}")
+    return remapped, new_desc_map
+
+
+def load_data(test_ratio=0.2, seed=42, dataset='both', exclude_actions=None):
+    base_name, base_dir = _resolve_dump_base_dir()
     if dataset == 'both':
         files = glob.glob(os.path.join(base_dir, "**", "latent_actions.pt"), recursive=True)
     else:
@@ -118,6 +183,7 @@ def load_data(test_ratio=0.2, seed=42, dataset='both', dump_dir_idx=1):
 
     samples_by_game = defaultdict(list)
     unique_games = []
+    global_desc_map = {}
 
     for f in files:
         try:
@@ -131,7 +197,8 @@ def load_data(test_ratio=0.2, seed=42, dataset='both', dump_dir_idx=1):
             z = z.unsqueeze(0)
 
         try:
-            actions = _extract_actions(data, z.shape[0], f)
+            actions, desc_map = _extract_actions(data, z.shape[0], f)
+            global_desc_map.update(desc_map)
         except (RuntimeError, TypeError, ValueError) as e:
             print(f"Skipping {f}: {e}")
             continue
@@ -152,7 +219,20 @@ def load_data(test_ratio=0.2, seed=42, dataset='both', dump_dir_idx=1):
             "All files were missing actions or unreadable."
         )
 
-    min_count = min(len(samples) for samples in samples_by_game.values())
+    # Filter and remap actions if exclude_actions is specified
+    if exclude_actions:
+        original_desc_map = dict(global_desc_map)
+        for game_name in unique_games:
+            samples_by_game[game_name], new_desc_map = _filter_and_remap_actions(
+                samples_by_game[game_name], original_desc_map, exclude_actions
+            )
+        global_desc_map = new_desc_map
+        # Remove games that have no samples left after filtering
+        unique_games = [g for g in unique_games if len(samples_by_game[g]) >= 2]
+        if not unique_games:
+            raise RuntimeError("No games with enough samples remaining after action filtering.")
+
+    min_count = min(len(samples_by_game[g]) for g in unique_games)
     if min_count < 2:
         raise RuntimeError('Need at least two samples per game to create a train/test split.')
 
@@ -193,7 +273,7 @@ def load_data(test_ratio=0.2, seed=42, dataset='both', dump_dir_idx=1):
     train_dataset = TensorDataset(train_z, train_actions, train_games)
     test_dataset = TensorDataset(test_z, test_actions, test_games)
 
-    return train_dataset, test_dataset, num_actions, unique_games, action_mode
+    return train_dataset, test_dataset, num_actions, unique_games, action_mode, global_desc_map
 
 
 def _accuracy_from_logits(logits, targets, action_mode):
@@ -315,9 +395,9 @@ def evaluate_multiclass_model(model, loader, unique_games, device, target_index=
     }
     return total_accuracy, per_game_accuracy
 
-def load_data_per_game(test_ratio=0.2, seed=42, dataset='both', dump_dir_idx=1):
+def load_data_per_game(test_ratio=0.2, seed=42, dataset='both', exclude_actions=None):
     """Load data grouped by game. Returns dict: game_name -> (train_dataset, test_dataset, num_actions, action_mode)."""
-    base_name, base_dir = _resolve_dump_base_dir(dump_dir_idx)
+    base_name, base_dir = _resolve_dump_base_dir()
     if dataset == 'both':
         files = glob.glob(os.path.join(base_dir, "**", "latent_actions.pt"), recursive=True)
     else:
@@ -327,6 +407,7 @@ def load_data_per_game(test_ratio=0.2, seed=42, dataset='both', dump_dir_idx=1):
         raise RuntimeError(f'No latent_actions.pt files found under {base_name}/ ({base_dir}).')
 
     samples_by_game = defaultdict(list)
+    global_desc_map = {}
 
     for f in files:
         try:
@@ -340,7 +421,8 @@ def load_data_per_game(test_ratio=0.2, seed=42, dataset='both', dump_dir_idx=1):
             z = z.unsqueeze(0)
 
         try:
-            actions = _extract_actions(data, z.shape[0], f)
+            actions, desc_map = _extract_actions(data, z.shape[0], f)
+            global_desc_map.update(desc_map)
         except (RuntimeError, TypeError, ValueError) as e:
             print(f"Skipping {f}: {e}")
             continue
@@ -358,6 +440,15 @@ def load_data_per_game(test_ratio=0.2, seed=42, dataset='both', dump_dir_idx=1):
             f"No usable samples found under {base_name}/ ({base_dir}). "
             "All files were missing actions or unreadable."
         )
+
+    # Filter and remap actions if exclude_actions is specified
+    if exclude_actions:
+        original_desc_map = dict(global_desc_map)
+        for game_name in list(samples_by_game.keys()):
+            samples_by_game[game_name], new_desc_map = _filter_and_remap_actions(
+                samples_by_game[game_name], original_desc_map, exclude_actions
+            )
+        global_desc_map = new_desc_map
 
     rng = random.Random(seed)
     game_datasets = {}
@@ -400,7 +491,7 @@ def load_data_per_game(test_ratio=0.2, seed=42, dataset='both', dump_dir_idx=1):
             action_mode,
         )
 
-    return game_datasets
+    return game_datasets, global_desc_map
 
 
 def train_per_game(game_datasets, args, device):
@@ -474,8 +565,8 @@ def main():
                         help='Dimensions to zero out during training (e.g. --mask 0 3 5)')
     parser.add_argument('--dataset', type=str, default='both', choices=['adaworld', 'olafworld', 'both'],
                         help='Which dataset to train on (default: both)')
-    parser.add_argument('--dump-dir', type=int, choices=[1,2], default=1, dest='dump_dir',
-                        help='Which dump dir to use: 1 -> latent_actions_dump, 2 -> latent_actions_dump_2')
+    parser.add_argument('--exclude_actions', type=str, nargs='*', default=[],
+                        help='Action descriptions to exclude (e.g. --exclude_actions up shoot)')
     parser.add_argument('--per_game', action='store_true',
                         help='Train a separate model for each game instead of a single shared model')
     args = parser.parse_args()
@@ -485,7 +576,7 @@ def main():
 
     if args.per_game:
         print("Loading per-game data...")
-        game_datasets = load_data_per_game(dataset=args.dataset, dump_dir_idx=args.dump_dir)
+        game_datasets, desc_map = load_data_per_game(dataset=args.dataset, exclude_actions=args.exclude_actions or None)
         print(f"Games: {list(game_datasets.keys())}")
         per_game_results = train_per_game(game_datasets, args, device)
         print(f"\n{'='*60}")
@@ -497,7 +588,7 @@ def main():
         return
 
     print("Loading data...")
-    train_dataset, test_dataset, num_actions, unique_games, action_mode = load_data(dataset=args.dataset, dump_dir_idx=args.dump_dir)
+    train_dataset, test_dataset, num_actions, unique_games, action_mode, desc_map = load_data(dataset=args.dataset, exclude_actions=args.exclude_actions or None)
     print(f"Train samples: {len(train_dataset)}, Test samples: {len(test_dataset)}")
     print(f"Hidden layers (actions): {args.action_hidden_layers}, Hidden layers (game): {args.game_hidden_layers}")
     print(f"Games: {unique_games}")
@@ -541,7 +632,8 @@ def main():
     print(f"Total accuracy: {total_accuracy:.4f}")
     print("\nPer-action accuracy:")
     for action_key in sorted(per_action_accuracy.keys()):
-        print(f"  A{action_key}: {per_action_accuracy[action_key]:.4f}")
+        label = desc_map.get(action_key, f"A{action_key}")
+        print(f"  {label}: {per_action_accuracy[action_key]:.4f}")
     # for game_name in unique_games:
     #     print(f"{game_name}: {per_game_accuracy[game_name]:.4f}")
 
