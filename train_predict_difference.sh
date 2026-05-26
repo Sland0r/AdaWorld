@@ -14,10 +14,11 @@ module load Anaconda3/2025.06-1
 source activate adaworld
 
 python -u new_stuff/train_predict_difference.py \
-    --epochs 100 \
+    --epochs 50 \
     --base_channels 64 \
-    --batch_size 512 \
+    --batch_size 128 \
     --lr 1e-3 \
     --dump_dir 2 \
-    --seed 42 \
+    --model adaworld \
+    --seed 40 \
     #--baseline

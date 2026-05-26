@@ -12,6 +12,8 @@ import cv2
 from tqdm import tqdm
 import random
 
+FLOW_SAMPLE_PROB = 1.0 / 20.0
+
 class CNNDecoder(nn.Module):
     def __init__(self, z_dim, out_channels, target_h, target_w, base_channels=64):
         super().__init__()
@@ -50,6 +52,8 @@ class CNNDecoder(nn.Module):
         return x
 
 def dense_flow(prev_bgr: np.ndarray, next_bgr: np.ndarray) -> np.ndarray:
+    prev_bgr = cv2.resize(prev_bgr, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+    next_bgr = cv2.resize(next_bgr, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
     prev_gray = cv2.cvtColor(prev_bgr, cv2.COLOR_BGR2GRAY)
     next_gray = cv2.cvtColor(next_bgr, cv2.COLOR_BGR2GRAY)
     flow = cv2.calcOpticalFlowFarneback(
@@ -103,6 +107,9 @@ def load_data(model_name, force_extract=False):
                 tgt_path = os.path.join(frames_dir, f"{tgt_idx:06d}.jpg")
                 if not os.path.exists(src_path) or not os.path.exists(tgt_path):
                     continue
+                if random.random() >= FLOW_SAMPLE_PROB:
+                    continue
+
                 s_img = cv2.imread(src_path)
                 t_img = cv2.imread(tgt_path)
                 if s_img is None or t_img is None:

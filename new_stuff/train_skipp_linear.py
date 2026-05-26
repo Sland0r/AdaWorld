@@ -171,7 +171,7 @@ def _filter_and_remap_actions(samples, desc_map, exclude_actions):
     return remapped, new_desc_map
 
 
-def load_data(test_ratio=0.2, seed=42, dataset='both', exclude_actions=None):
+def load_data(test_ratio=0.1, seed=42, dataset='both', exclude_actions=None):
     base_name, base_dir = _resolve_dump_base_dir()
     if dataset == 'both':
         files = glob.glob(os.path.join(base_dir, "**", "latent_actions.pt"), recursive=True)
@@ -232,21 +232,22 @@ def load_data(test_ratio=0.2, seed=42, dataset='both', exclude_actions=None):
         if not unique_games:
             raise RuntimeError("No games with enough samples remaining after action filtering.")
 
-    min_count = min(len(samples_by_game[g]) for g in unique_games)
-    if min_count < 2:
-        raise RuntimeError('Need at least two samples per game to create a train/test split.')
+    # Global split: choose ~test_ratio fraction of all samples as the test set.
+    all_samples = []
+    for game_name in unique_games:
+        all_samples.extend(samples_by_game[game_name])
 
-    test_per_game = max(1, int(round(min_count * test_ratio)))
-    test_per_game = min(test_per_game, min_count - 1)
+    total_samples = len(all_samples)
+    if total_samples < 2:
+        raise RuntimeError('Need at least two total samples to create a train/test split.')
 
     rng = random.Random(seed)
-    train_samples = []
-    test_samples = []
-    for game_name in unique_games:
-        game_samples = list(samples_by_game[game_name])
-        rng.shuffle(game_samples)
-        test_samples.extend(game_samples[:test_per_game])
-        train_samples.extend(game_samples[test_per_game:])
+    rng.shuffle(all_samples)
+    test_count = max(1, int(round(total_samples * test_ratio)))
+    test_count = min(test_count, total_samples - 1)
+
+    test_samples = all_samples[:test_count]
+    train_samples = all_samples[test_count:]
 
     train_z, train_actions, train_games = _build_dataset(train_samples)
     test_z, test_actions, test_games = _build_dataset(test_samples)
@@ -395,7 +396,7 @@ def evaluate_multiclass_model(model, loader, unique_games, device, target_index=
     }
     return total_accuracy, per_game_accuracy
 
-def load_data_per_game(test_ratio=0.2, seed=42, dataset='both', exclude_actions=None):
+def load_data_per_game(test_ratio=0.1, seed=42, dataset='both', exclude_actions=None):
     """Load data grouped by game. Returns dict: game_name -> (train_dataset, test_dataset, num_actions, action_mode)."""
     base_name, base_dir = _resolve_dump_base_dir()
     if dataset == 'both':
@@ -569,6 +570,8 @@ def main():
                         help='Action descriptions to exclude (e.g. --exclude_actions up shoot)')
     parser.add_argument('--per_game', action='store_true',
                         help='Train a separate model for each game instead of a single shared model')
+    parser.add_argument('--test_ratio', type=float, default=0.1,
+                        help='Fraction of samples to use for test (per-game). Default 0.1')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -576,7 +579,7 @@ def main():
 
     if args.per_game:
         print("Loading per-game data...")
-        game_datasets, desc_map = load_data_per_game(dataset=args.dataset, exclude_actions=args.exclude_actions or None)
+        game_datasets, desc_map = load_data_per_game(test_ratio=args.test_ratio, dataset=args.dataset, exclude_actions=args.exclude_actions or None)
         print(f"Games: {list(game_datasets.keys())}")
         per_game_results = train_per_game(game_datasets, args, device)
         print(f"\n{'='*60}")
@@ -588,7 +591,7 @@ def main():
         return
 
     print("Loading data...")
-    train_dataset, test_dataset, num_actions, unique_games, action_mode, desc_map = load_data(dataset=args.dataset, exclude_actions=args.exclude_actions or None)
+    train_dataset, test_dataset, num_actions, unique_games, action_mode, desc_map = load_data(test_ratio=args.test_ratio, dataset=args.dataset, exclude_actions=args.exclude_actions or None)
     print(f"Train samples: {len(train_dataset)}, Test samples: {len(test_dataset)}")
     print(f"Hidden layers (actions): {args.action_hidden_layers}, Hidden layers (game): {args.game_hidden_layers}")
     print(f"Games: {unique_games}")

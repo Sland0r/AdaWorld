@@ -15,6 +15,5 @@ PYTHON=~/.conda/envs/adaworld/bin/python
 export PYTHONNOUSERSITE=1
 export PYTHONPATH=""
 
-$PYTHON new_stuff/analysis.py \
-    --dataset adaworld \
+$PYTHON new_stuff/analysis_flex.py \
     --dump-dir 3 \

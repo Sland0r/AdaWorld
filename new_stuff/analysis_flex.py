@@ -12,7 +12,7 @@ def main():
     parser = argparse.ArgumentParser(description="Extract all latents from latent_actions_dump and compute statistics.")
     parser.add_argument("--dump-dir", type=int, choices=[1,2,3], default=1,
                         help="Which dump dir to use: 1 -> latent_actions_dump, 2 -> latent_actions_dump_2")
-    parser.add_argument("--dataset", type=str, default="adaworld",
+    parser.add_argument("--dataset", type=str, default="",
                         help="Dataset subdir in the dump directory (e.g., adaworld)")
     parser.add_argument("--delete", action="store_true",
                         help="Skip (delete) samples with multiple simultaneous actions. "
@@ -58,51 +58,19 @@ def main():
 
         z_mu = data['z_mu'] # (N, D)
 
-        # Build actions list — handle both old and P2P formats
+        # Build actions list
         actions = []
-        if 'keyboard_labels' in data:
-            # P2P format: multi-hot keyboard labels + mouse buttons → action tuples
-            kb_labels = data['keyboard_labels']  # (N, 10) int tensor
-            kb_keys = data.get('keyboard_keys', [f'key_{i}' for i in range(kb_labels.shape[1])])
-            mouse_buttons = data.get('mouse_buttons', None)  # (N,) int: 0=left, 1=right, 2=none
-            mouse_btn_names = {0: 'left_click', 1: 'right_click'}
-            for i in range(kb_labels.shape[0]):
-                pressed = [k for k, v in zip(kb_keys, kb_labels[i]) if v == 1]
-                # Append mouse button if it's a click (not "none"=2)
-                if mouse_buttons is not None and int(mouse_buttons[i]) in mouse_btn_names:
-                    pressed.append(mouse_btn_names[int(mouse_buttons[i])])
-                actions.append(tuple(pressed) if pressed else ('none',))
-        else:
-            # Old retro format
-            actions = data.get('actions', [])
-            # Some dumps store actions as a single-item list containing a sequence
-            if len(actions) == 1 and isinstance(actions[0], (list, tuple)):
-                if len(actions[0]) == z_mu.shape[0]:
-                    actions = list(actions[0])
-            
-            # Check if actions are 1-hot or multi-hot encoded numeric vectors
-            if len(actions) > 0:
-                first_act = actions[0]
-                is_numeric_seq = False
-                if isinstance(first_act, torch.Tensor):
-                    is_numeric_seq = first_act.ndim > 0
-                elif isinstance(first_act, np.ndarray):
-                    is_numeric_seq = first_act.ndim > 0 and (np.issubdtype(first_act.dtype, np.number) or np.issubdtype(first_act.dtype, np.bool_))
-                elif isinstance(first_act, (list, tuple)) and len(first_act) > 1:
-                    is_numeric_seq = isinstance(first_act[0], (int, float, bool, np.number, np.bool_))
-                
-                if is_numeric_seq:
-                    new_actions = []
-                    for a in actions:
-                        if a is None:
-                            new_actions.append(None)
-                            continue
-                        if isinstance(a, torch.Tensor):
-                            a = a.tolist()
-                        # Use val > 0 to handle cases where multiple actions are normalized (e.g. 0.5, 0.5)
-                        pressed = tuple(idx for idx, val in enumerate(a) if val > 0)
-                        new_actions.append(pressed if pressed else ('none',))
-                    actions = new_actions
+        raw_actions = data.get('actions', [])
+        valid_actions = {'right', 'left', 'crouch', 'jump'}
+        for a in raw_actions:
+            if isinstance(a, dict) and 'desc' in a:
+                desc = a['desc']
+                if desc in valid_actions:
+                    actions.append((desc,))
+                else:
+                    actions.append(('none',))
+            else:
+                actions.append(('none',))
         
         all_z_mu.append(z_mu)
         
@@ -118,7 +86,7 @@ def main():
                 if actions[i] is None:
                     continue
                 act = tuple(actions[i]) if not isinstance(actions[i], tuple) else actions[i]
-                if not act:
+                if not act or act == ('none',):
                     continue
 
                 z_mu_i = z_mu[i].unsqueeze(0) # (1, D)
@@ -169,7 +137,7 @@ def main():
     print("="*80)
     print(f"Total samples: {all_z_mu_cat.shape[0]}")
     print("Variance per dimension:")
-    print(np.array2string(overall_var.numpy(), precision=4, suppress_small=True, separator=', '))
+    print(np.array2string(overall_var.numpy()[:10], precision=4, suppress_small=True, separator=', '))
 
 
 
@@ -187,7 +155,7 @@ def main():
         z_mu_cat = action_cats[act]
         var = torch.var(z_mu_cat, dim=0, unbiased=False) if z_mu_cat.shape[0] > 1 else torch.zeros(z_mu_cat.shape[1])
         print(f"\nAction Tuple: {act} (Samples: {z_mu_cat.shape[0]})")
-        print(np.array2string(var.numpy(), precision=4, suppress_small=True, separator=', '))
+        print(np.array2string(var.numpy()[:10], precision=4, suppress_small=True, separator=', '))
 
 
     print("\n" + "="*80)
@@ -239,7 +207,7 @@ def main():
 
     print("\nPer-action centroids:")
     for act, c in zip(action_list, centroids):
-        print(f"  {action_label[act]}: {np.array2string(c, precision=4, suppress_small=True, separator=', ', max_line_width=120)}")
+        print(f"  {action_label[act]}: {np.array2string(c[:10], precision=4, suppress_small=True, separator=', ', max_line_width=120)}")
 
     print("\nPairwise L2 centroid distances:")
     n_acts = len(action_list)
@@ -274,7 +242,7 @@ def main():
     fisher_orig = between_var_orig / (within_var_orig + 1e-10)
 
     print(f"\n  {'Dim':>4}  {'Fisher':>10}  {'Between':>10}  {'Within':>10}")
-    for d in np.argsort(fisher_orig)[::-1]:
+    for d in np.argsort(fisher_orig)[::-1][:10]:
         print(f"  {d:>4}  {fisher_orig[d]:>10.6f}  {between_var_orig[d]:>10.6f}  {within_var_orig[d]:>10.6f}")
 
     print("\n" + "="*80)
@@ -302,7 +270,7 @@ def main():
     fisher_proj = between_var_proj / (within_var_proj + 1e-10)
 
     print(f"\n  {'PC':>4}  {'Fisher':>10}  {'Between':>10}  {'Within':>10}")
-    for d in np.argsort(fisher_proj)[::-1]:
+    for d in np.argsort(fisher_proj)[::-1][:10]:
         print(f"  {d+1:>4}  {fisher_proj[d]:>10.6f}  {between_var_proj[d]:>10.6f}  {within_var_proj[d]:>10.6f}")
 
     # ----------------------------------------------------------------- 3. LDA --
@@ -323,120 +291,47 @@ def main():
     for i in range(min(3, lda.scalings_.shape[1])):
         vec = lda.scalings_[:, i]
         vec = vec / np.linalg.norm(vec)
-        print(f"  LD{i+1}: {np.array2string(vec, precision=4, suppress_small=True, separator=', ', max_line_width=120)}")
+        print(f"  LD{i+1}: {np.array2string(vec[:10], precision=4, suppress_small=True, separator=', ', max_line_width=120)}")
 
-    # ---- build probe dataset (multi-label: top 10 individual keys) ----
-    # Extract all individual keys from original action tuples and find top 10
-    if args.dump_dir == 2 and original_action_z_mu:
-        all_keys = {}
-        action_to_zmu = {}  # Map action tuple to list of (z_mu, action_tuple)
-        
-        for act, z_mus in original_action_z_mu.items():
-            action_to_zmu[act] = z_mus
-            for key in act:
-                all_keys[key] = all_keys.get(key, 0) + len(z_mus)
-        
-        # Get top 10 keys by frequency
-        top_keys = sorted(all_keys.keys(), key=lambda k: all_keys[k], reverse=True)[:10]
-        key_to_idx = {key: i for i, key in enumerate(top_keys)}
-        
-        print(f"  Using multi-label classification with top 10 individual keys:")
-        print(f"  {top_keys}")
-        
-        # Collect all samples and create multi-hot labels
-        X_probe_list = []
-        y_probe_list = []
-        
-        for act, z_mus in action_to_zmu.items():
-            # Create multi-hot label for this action
-            label = np.zeros(10, dtype=np.int32)
-            for key in act:
-                if key in key_to_idx:
-                    label[key_to_idx[key]] = 1
-            
-            # Add all z_mu samples with this label
-            z_mu_cat = torch.cat(z_mus, dim=0).numpy()
-            X_probe_list.append(z_mu_cat)
-            y_probe_list.append(np.tile(label, (z_mu_cat.shape[0], 1)))
-        
-        X_probe = np.concatenate(X_probe_list, axis=0)
-        y_probe = np.concatenate(y_probe_list, axis=0)
-        
-    else:
-        print("  ERROR: Multi-label probe requires dump_dir=2 with original_action_z_mu")
-        top_keys = []
-        key_to_idx = {}
-        X_probe = None
-        y_probe = None
-
-    print("\n" + "="*80)
     # -------------------------------------------------------- 4. LINEAR PROBE --
     print("\n" + "="*80)
-    print("  4. LINEAR PROBE (Multi-label: predict any combination of 10 keys)")
+    print("  4. LINEAR PROBE (Multi-class: predict 1 action at a time)")
     print("="*80)
 
-    if X_probe is not None and y_probe is not None:
-        from sklearn.multioutput import MultiOutputClassifier
+    if len(X_labeled) > 0:
+        from sklearn.metrics import accuracy_score, precision_recall_fscore_support
         
-        # Split preserving multi-label structure
         X_tr, X_te, y_tr, y_te = train_test_split(
-            X_probe, y_probe, test_size=0.2, random_state=42
+            X_labeled, y_labeled, test_size=0.2, random_state=42
         )
         
-        # Train a binary classifier for each key (multi-label)
-        probe = MultiOutputClassifier(
-            LogisticRegression(max_iter=1000, C=1.0, solver='lbfgs')
-        )
+        probe = LogisticRegression(max_iter=1000, C=1.0, solver='lbfgs', multi_class='multinomial')
         probe.fit(X_tr, y_tr)
         
-        # Evaluate
         y_pred = probe.predict(X_te)
         
-        # Hamming loss (fraction of incorrect labels)
-        from sklearn.metrics import hamming_loss, accuracy_score, precision_recall_fscore_support
-        hamming = hamming_loss(y_te, y_pred)
-        
-        # Exact match accuracy (all 10 labels correct)
-        exact_match = accuracy_score(y_te, y_pred)
-        
-        # Overall multi-label precision/recall/F1
+        acc = accuracy_score(y_te, y_pred)
         p_micro, r_micro, f1_micro, _ = precision_recall_fscore_support(
             y_te, y_pred, average='micro', zero_division=0
         )
         p_macro, r_macro, f1_macro, _ = precision_recall_fscore_support(
             y_te, y_pred, average='macro', zero_division=0
         )
-
-        # Per-key metrics
-        per_key_acc = []
-        per_key_precision = []
-        per_key_recall = []
-        per_key_f1 = []
-        for i, key in enumerate(top_keys):
-            key_pred = y_pred[:, i]
-            key_true = y_te[:, i]
-            key_acc = accuracy_score(key_true, key_pred)
-            key_p, key_r, key_f1, _ = precision_recall_fscore_support(
-                key_true, key_pred, average='binary', zero_division=0
-            )
-            per_key_acc.append(key_acc)
-            per_key_precision.append(key_p)
-            per_key_recall.append(key_r)
-            per_key_f1.append(key_f1)
         
-        print(f"\n  Exact match accuracy (all 10 correct): {exact_match:.4f}  ({exact_match*100:.1f}%)")
-        print(f"  Hamming loss (label error rate):      {hamming:.4f}  ({hamming*100:.1f}%)")
-        print(f"  Micro P/R/F1:                         {p_micro:.4f} / {r_micro:.4f} / {f1_micro:.4f}")
-        print(f"  Macro P/R/F1:                         {p_macro:.4f} / {r_macro:.4f} / {f1_macro:.4f}")
-        print(f"\n  Per-key metrics:")
-        for i, key in enumerate(top_keys):
-            pos_count = (y_te[:, i] == 1).sum()
-            neg_count = (y_te[:, i] == 0).sum()
+        print(f"\n  Overall Accuracy: {acc:.4f}  ({acc*100:.1f}%)")
+        print(f"  Micro P/R/F1:     {p_micro:.4f} / {r_micro:.4f} / {f1_micro:.4f}")
+        print(f"  Macro P/R/F1:     {p_macro:.4f} / {r_macro:.4f} / {f1_macro:.4f}")
+        print(f"\n  Per-class metrics:")
+        
+        p_class, r_class, f1_class, support = precision_recall_fscore_support(
+            y_te, y_pred, average=None, labels=np.arange(len(action_list)), zero_division=0
+        )
+        
+        for i, act in enumerate(action_list):
             print(
-                f"    Key {i}: {key:15s} — "
-                f"Acc: {per_key_acc[i]:.4f}, "
-                f"P/R/F1: {per_key_precision[i]:.4f}/{per_key_recall[i]:.4f}/{per_key_f1[i]:.4f}  "
-                f"(pos={pos_count}, neg={neg_count})"
+                f"    Class {i}: {str(act[0]):15s} — "
+                f"P/R/F1: {p_class[i]:.4f}/{r_class[i]:.4f}/{f1_class[i]:.4f}  "
+                f"(support={support[i]})"
             )
 
     # --------------------------------------------------- 5. ENTANGLEMENT TEST --
@@ -530,9 +425,9 @@ def fit_and_print_pca(label, X_np, top_k=None, n_vectors=0):
         print(f"  {i+1:>4}  {var[i]:>12.6f}  {ratio[i]:>10.6f}  {cumulative[i]:>10.6f}")
         if i < n_vectors:
             vec = pca.components_[i]
-            print(f"        vector: {np.array2string(vec, precision=4, suppress_small=True, separator=', ', max_line_width=120)}")
+            print(f"        vector: {np.array2string(vec[:10], precision=4, suppress_small=True, separator=', ', max_line_width=120)}")
     weighted_avg = (ratio[:, None] * pca.components_).sum(axis=0)
-    print(f"  weighted avg vector: {np.array2string(weighted_avg, precision=4, suppress_small=True, separator=', ', max_line_width=120)}")
+    print(f"  weighted avg vector: {np.array2string(weighted_avg[:10], precision=4, suppress_small=True, separator=', ', max_line_width=120)}")
 
 
 if __name__ == '__main__':

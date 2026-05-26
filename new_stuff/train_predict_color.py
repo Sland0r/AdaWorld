@@ -15,6 +15,7 @@ import glob
 import os
 from pathlib import Path
 import numpy as np
+import cv2
 from collections import defaultdict
 import random
 from tqdm import tqdm
@@ -84,6 +85,96 @@ def load_color_histograms(base_dir, num_samples, cache_dir='/scratch-shared/FoMo
     return torch.stack(histograms, dim=0)[:num_samples]
 
 
+def color_histogram(image_bgr, bins_per_channel=256):
+    """Compute a normalized color histogram from a BGR image."""
+    channels = cv2.split(image_bgr)
+    histograms = []
+    for channel in channels:
+        hist = cv2.calcHist([channel], [0], None, [bins_per_channel], [0, 256])
+        histograms.append(hist.reshape(-1))
+    histogram = np.concatenate(histograms, axis=0).astype(np.float32)
+    total = float(histogram.sum())
+    if total > 0:
+        histogram /= total
+    return histogram
+
+
+def load_p2p_data_color(model_name, cache_dir='/scratch-shared/FoMo-Atomic-Actions/_cache/p2p',
+                        p2p_video_root='/scratch-shared/FoMo-Atomic-Actions/open-p2p-subset',
+                        force_extract=False):
+    """Load latent actions + color histogram targets from P2P videos.
+    Caches results in scratch-shared. Modeled after train_predict_skipped_color.py."""
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_z = os.path.join(cache_dir, f'{model_name}_z_mu_color.pt')
+    cache_t = os.path.join(cache_dir, f'{model_name}_color_targets.pt')
+
+    if not force_extract and os.path.exists(cache_z) and os.path.exists(cache_t):
+        print(f"Loading cached P2P color data for {model_name}...")
+        return torch.load(cache_z, map_location='cpu'), torch.load(cache_t, map_location='cpu')
+
+    print(f"Extracting color targets from P2P videos for {model_name}...")
+    repo_root = Path(__file__).resolve().parents[1]
+    base_dir = str(repo_root / 'latent_actions_dump_2' / model_name)
+    files = sorted(glob.glob(os.path.join(base_dir, '**', 'latent_actions.pt'), recursive=True))
+    if not files:
+        raise RuntimeError(f'No latent_actions.pt files found in {base_dir}')
+
+    all_z = []
+    all_t = []
+
+    for f in tqdm(files, desc='Extracting P2P color targets'):
+        try:
+            data = torch.load(f, map_location='cpu', weights_only=False)
+            z = data['z_mu']
+            if z.ndim == 1:
+                z = z.unsqueeze(0)
+
+            # Derive UUID from path: .../latent_actions_dump_2/{model}/{uuid}/latent_actions.pt
+            uuid = os.path.basename(os.path.dirname(f))
+            video_path = os.path.join(p2p_video_root, uuid, 'video.mp4')
+            if not os.path.exists(video_path):
+                print(f'  Video not found for {uuid}, skipping')
+                continue
+
+            cap = cv2.VideoCapture(video_path)
+            if not cap.isOpened():
+                print(f'  Cannot open video for {uuid}, skipping')
+                continue
+
+            frames = []
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                frames.append(frame)
+            cap.release()
+
+            n_pairs = len(frames) - 1
+            if n_pairs != z.shape[0]:
+                n_use = min(n_pairs, z.shape[0])
+            else:
+                n_use = n_pairs
+
+            for i in range(n_use):
+                hist = color_histogram(frames[i + 1])
+                all_z.append(z[i])
+                all_t.append(torch.from_numpy(hist).float())
+
+            del frames
+        except Exception as e:
+            print(f'Skipping {f}: {e}')
+
+    if not all_z:
+        raise RuntimeError('No usable P2P color data found')
+
+    Z = torch.stack(all_z, dim=0)
+    T = torch.stack(all_t, dim=0)
+    torch.save(Z, cache_z)
+    torch.save(T, cache_t)
+    print(f'Cached {Z.shape[0]} P2P color samples to {cache_dir}')
+    return Z, T
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train MLP to predict color histogram from latent actions")
     parser.add_argument('--epochs', type=int, default=50)
@@ -91,7 +182,9 @@ def main():
     parser.add_argument('--hidden_dim', type=int, default=256, help='Hidden layer dimension')
     parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--lr', type=float, default=1e-3)
-    parser.add_argument('--dump_dir', type=int, choices=[1, 2], default=1, help='1=latent_actions_dump, 2=latent_actions_dump_2')
+    parser.add_argument('--dump_dir', type=int, choices=[1, 2, 3], default=1, help='1=latent_actions_dump, 2=latent_actions_dump_2, 3=latent_actions_videoflextok')
+    parser.add_argument('--model', type=str, default='olafworld', choices=['adaworld', 'olafworld'],
+                        help='Model subdirectory to load from (only used with --dump_dir 2)')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--baseline', action='store_true', help='Use random inputs instead of latent actions')
     args = parser.parse_args()
@@ -102,29 +195,55 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    # Resolve dump directory
-    repo_root = Path(__file__).resolve().parents[1]
-    latent_base = str(repo_root / ('latent_actions_dump' if args.dump_dir == 1 else 'latent_actions_dump_2'))
-    color_base = '/scratch-shared/FoMo-Atomic-Actions/color_dump/random_actions_data'
+    if args.dump_dir == 2:
+        # P2P path: extract targets from P2P video frames
+        z, color = load_p2p_data_color(args.model)
+        print(f"Loaded {z.shape[0]} P2P latent vectors, dim={z.shape[1]}")
+        print(f"Loaded {color.shape[0]} P2P color histograms, output dim={color.shape[1]}")
+    elif args.dump_dir == 3:
+        # VideoFlexTok path: latents from latent_actions_videoflextok, retro game targets
+        repo_root = Path(__file__).resolve().parents[1]
+        latent_base = str(repo_root / 'latent_actions_videoflextok')
+        color_base = '/scratch-shared/FoMo-Atomic-Actions/color_dump/random_actions_data'
 
-    print("Loading latent actions...")
-    z = load_latent_actions(latent_base)
-    print(f"Loaded {z.shape[0]} latent vectors, dim={z.shape[1]}")
+        print("Loading VideoFlexTok latent actions...")
+        z = load_latent_actions(latent_base)
+        print(f"Loaded {z.shape[0]} VideoFlexTok latent vectors, dim={z.shape[1]}")
+
+        print("Loading color histogram targets...")
+        color = load_color_histograms(color_base, z.shape[0])
+        print(f"Loaded {color.shape[0]} color histograms, output dim={color.shape[1]}")
+
+        # Ensure alignment
+        if z.shape[0] != color.shape[0]:
+            min_samples = min(z.shape[0], color.shape[0])
+            z = z[:min_samples]
+            color = color[:min_samples]
+            print(f"Aligned to {min_samples} samples")
+    else:
+        # Retro game path: use shared cache
+        repo_root = Path(__file__).resolve().parents[1]
+        latent_base = str(repo_root / 'latent_actions_dump')
+        color_base = '/scratch-shared/FoMo-Atomic-Actions/color_dump/random_actions_data'
+
+        print("Loading latent actions...")
+        z = load_latent_actions(latent_base)
+        print(f"Loaded {z.shape[0]} latent vectors, dim={z.shape[1]}")
+
+        print("Loading color histogram targets...")
+        color = load_color_histograms(color_base, z.shape[0])
+        print(f"Loaded {color.shape[0]} color histograms, output dim={color.shape[1]}")
+
+        # Ensure alignment
+        if z.shape[0] != color.shape[0]:
+            min_samples = min(z.shape[0], color.shape[0])
+            z = z[:min_samples]
+            color = color[:min_samples]
+            print(f"Aligned to {min_samples} samples")
 
     if args.baseline:
         print("BASELINE MODE: replacing latent actions with random tensors")
         z = torch.randn_like(z)
-
-    print("Loading color histogram targets...")
-    color = load_color_histograms(color_base, z.shape[0])
-    print(f"Loaded {color.shape[0]} color histograms, output dim={color.shape[1]}")
-
-    # Ensure alignment
-    if z.shape[0] != color.shape[0]:
-        min_samples = min(z.shape[0], color.shape[0])
-        z = z[:min_samples]
-        color = color[:min_samples]
-        print(f"Aligned to {min_samples} samples")
 
     # Train/test split
     test_ratio = 0.2

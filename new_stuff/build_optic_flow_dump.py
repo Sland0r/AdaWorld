@@ -10,6 +10,9 @@ import cv2
 import numpy as np
 
 
+FLOW_SAMPLE_PROB = 1.0 / 20.0
+
+
 @dataclass
 class GameSample:
     count_seen: int
@@ -33,6 +36,8 @@ def sorted_frame_files(frames_dir: str) -> List[str]:
 
 
 def dense_flow(prev_bgr: np.ndarray, next_bgr: np.ndarray) -> np.ndarray:
+    prev_bgr = cv2.resize(prev_bgr, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+    next_bgr = cv2.resize(next_bgr, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
     prev_gray = cv2.cvtColor(prev_bgr, cv2.COLOR_BGR2GRAY)
     next_gray = cv2.cvtColor(next_bgr, cv2.COLOR_BGR2GRAY)
     flow = cv2.calcOpticalFlowFarneback(
@@ -115,6 +120,9 @@ def process_dataset(src_root: str, dst_root: str, frame_step: int, pair_stride: 
 
         local_pairs = 0
         for i in range(0, len(frame_files) - frame_step, pair_stride):
+            if random.random() >= FLOW_SAMPLE_PROB:
+                continue
+
             frame_a = frame_files[i]
             frame_b = frame_files[i + frame_step]
 
